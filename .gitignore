@@ -31,3 +31,12 @@ build/
 
 ### VS Code ###
 .vscode/
+
+
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="1401px" height="1041px" viewBox="-0.5 -0.5 1401 1041" content="&lt;mxfile host=&quot;app.diagrams.net&quot;&gt;&lt;diagram&gt;...&lt;/diagram&gt;&lt;/mxfile&gt;">
+  <defs/>
+  <g>
+    <!-- Title -->
+    <rect x="0" y="0" width="1400" height="60" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+    <text x="700" y="38" font-family="Helvetica" font-size="24" font-weight="bold" text-anchor="middle" fill="#333333">Spring Boot Integration Architecture</text>
+ 
