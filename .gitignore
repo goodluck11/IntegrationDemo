@@ -31,3 +31,51 @@ build/
 
 ### VS Code ###
 .vscode/
+
+
+$env:HTTP_PROXY="http://proxy.yourbank.com:8080"
+$env:HTTPS_PROXY="http://proxy.yourbank.com:8080"
+
+
+Create/edit ~/.config/httpie/config.json:
+{
+    "default_options": [
+        "--proxy=http:http://proxy.yourbank.com:8080",
+        "--proxy=https:http://proxy.yourbank.com:8080"
+    ]
+}
+
+
+
+
+public WebClient webClientWithProxy() {
+        HttpClient httpClient = HttpClient.create()
+            .proxy(proxy -> proxy
+                .type(ProxyProvider.Proxy.HTTP)
+                .host("proxy.yourbank.com")
+                .port(8080)
+                // If authentication is needed
+                .username("proxyUsername")
+                .password(proxyPass -> "proxyPassword")
+            );
+
+        return WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .baseUrl("https://government-api.gov")
+            .build();
+    }
+
+
+
+proxy:
+  host: proxy.yourbank.com
+  port: 8080
+  username: ${PROXY_USERNAME:}  # From environment variable
+  password: ${PROXY_PASSWORD:}  # From environment variable
+
+government:
+  api:
+    base-url: https://government-api.gov
+
+
+
