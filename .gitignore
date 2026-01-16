@@ -2573,7 +2573,279 @@ class ActiveMQConfigBuilder {
 
 
 
+package ng.erikka.healthcheck.builders;
 
+import ng.erikka.healthcheck.HealthCheckBuilder;
+import ng.erikka.healthcheck.config.ApiAuthType;
+import ng.erikka.healthcheck.config.HttpMethod;
+import ng.erikka.healthcheck.config.SelfApiConfig;
+
+import java.time.Duration;
+import java.util.*;
+
+/**
+ * Builder for configuring self API health checks.
+ * 
+ * <p>Use this to validate your own application's endpoints work correctly,
+ * including authentication and ACL (Access Control List) validation.</p>
+ * 
+ * <h2>Usage Examples:</h2>
+ * 
+ * <h3>Validate Basic Auth on own endpoint:</h3>
+ * <pre>{@code
+ * .addSelfApi()
+ *     .name("Merchant API Auth")
+ *     .endpoint("/api/v1/merchants/health")
+ *     .expectedStatus(200)
+ *     .basicAuth("test_user", "test_password")
+ *     .and()
+ * }</pre>
+ * 
+ * <h3>Validate ACL with multiple User-Agents:</h3>
+ * <pre>{@code
+ * .addSelfApi()
+ *     .name("Mobile API ACL Check")
+ *     .endpoint("/api/v1/mobile/health")
+ *     .expectedStatus(200)
+ *     .bearerToken("${TEST_TOKEN}")
+ *     .validateAcl("ErikkaAndroid/1.0", "ErikkaIOS/1.0", "ErikkaWeb/1.0")
+ *     .and()
+ * }</pre>
+ * 
+ * <h3>Validate endpoint returns 401 without auth:</h3>
+ * <pre>{@code
+ * .addSelfApi()
+ *     .name("Auth Required Check")
+ *     .endpoint("/api/v1/secure/data")
+ *     .expectedStatus(401)  // Expect unauthorized
+ *     .noAuth()
+ *     .and()
+ * }</pre>
+ */
+public class SelfApiConfigBuilder {
+    
+    private final HealthCheckBuilder parent;
+    
+    private String name = "Self API";
+    private String endpoint;
+    private HttpMethod method = HttpMethod.GET;
+    private int expectedStatus = 200;
+    private ApiAuthType authType = ApiAuthType.NONE;
+    private String basicAuthUsername;
+    private String basicAuthPassword;
+    private String bearerToken;
+    private final Map<String, String> headers = new HashMap<>();
+    private final List<String> allowedUserAgents = new ArrayList<>();
+    private boolean validateAcl = false;
+    private Duration timeout = Duration.ofSeconds(10);
+    
+    public SelfApiConfigBuilder(HealthCheckBuilder parent) {
+        this.parent = parent;
+    }
+    
+    /**
+     * Sets a descriptive name for this self API check.
+     * 
+     * @param name the name (e.g., "Merchant API Auth", "Admin Endpoint ACL")
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder name(String name) {
+        this.name = name;
+        return this;
+    }
+    
+    /**
+     * Sets the endpoint path to check (relative to your application).
+     * 
+     * @param endpoint the relative path (e.g., "/api/v1/health")
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder endpoint(String endpoint) {
+        this.endpoint = endpoint;
+        return this;
+    }
+    
+    /**
+     * Sets the HTTP method to use.
+     * 
+     * @param method the HTTP method (GET, POST, HEAD, OPTIONS)
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder method(HttpMethod method) {
+        this.method = method;
+        return this;
+    }
+    
+    /**
+     * Sets the expected HTTP status code.
+     * 
+     * @param status the expected status (e.g., 200 for success, 401 for auth required)
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder expectedStatus(int status) {
+        this.expectedStatus = status;
+        return this;
+    }
+    
+    /**
+     * Configures no authentication for this request.
+     * Use this to verify endpoints reject unauthorized requests.
+     * 
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder noAuth() {
+        this.authType = ApiAuthType.NONE;
+        return this;
+    }
+    
+    /**
+     * Configures Basic Authentication.
+     * Supports environment variable syntax: "${ENV_VAR}"
+     * 
+     * @param username the test username
+     * @param password the test password
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder basicAuth(String username, String password) {
+        this.authType = ApiAuthType.BASIC;
+        this.basicAuthUsername = resolveEnvVariable(username);
+        this.basicAuthPassword = resolveEnvVariable(password);
+        return this;
+    }
+    
+    /**
+     * Configures Bearer Token authentication.
+     * Supports environment variable syntax: "${ENV_VAR}"
+     * 
+     * @param token the test bearer token
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder bearerToken(String token) {
+        this.authType = ApiAuthType.BEARER_TOKEN;
+        this.bearerToken = resolveEnvVariable(token);
+        return this;
+    }
+    
+    /**
+     * Sets allowed User-Agent values and enables ACL validation.
+     * The health check will test the endpoint with each user agent.
+     * 
+     * <p>This is useful for validating that your API correctly accepts
+     * requests from authorized clients (mobile apps, web apps, etc.).</p>
+     * 
+     * @param userAgents the allowed user agents to test
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder validateAcl(String... userAgents) {
+        this.allowedUserAgents.addAll(List.of(userAgents));
+        this.validateAcl = true;
+        return this;
+    }
+    
+    /**
+     * Adds allowed User-Agent values without enabling ACL validation.
+     * Use this if you want to include user agents in requests but not
+     * test each one individually.
+     * 
+     * @param userAgents the user agents
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder allowedUserAgents(String... userAgents) {
+        this.allowedUserAgents.addAll(List.of(userAgents));
+        return this;
+    }
+    
+    /**
+     * Adds a custom header to the request.
+     * 
+     * @param name the header name
+     * @param value the header value
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder header(String name, String value) {
+        this.headers.put(name, resolveEnvVariable(value));
+        return this;
+    }
+    
+    /**
+     * Sets the request timeout.
+     * 
+     * @param timeout the maximum time to wait for response
+     * @return this builder for chaining
+     */
+    public SelfApiConfigBuilder timeout(Duration timeout) {
+        this.timeout = timeout;
+        return this;
+    }
+    
+    /**
+     * Completes this self API configuration and returns to the parent builder.
+     * 
+     * @return the parent HealthCheckBuilder for chaining
+     * @throws IllegalStateException if required fields are missing
+     */
+    public HealthCheckBuilder and() {
+        validate();
+        
+        SelfApiConfig config = new SelfApiConfig(
+            name,
+            endpoint,
+            method,
+            expectedStatus,
+            authType,
+            basicAuthUsername,
+            basicAuthPassword,
+            bearerToken,
+            Map.copyOf(headers),
+            List.copyOf(allowedUserAgents),
+            validateAcl,
+            timeout
+        );
+        
+        parent.addSelfApiConfig(config);
+        return parent;
+    }
+    
+    private void validate() {
+        if (endpoint == null || endpoint.isEmpty()) {
+            throw new IllegalStateException(
+                "Self API check '" + name + "' requires an endpoint path."
+            );
+        }
+        
+        if (authType == ApiAuthType.BASIC && 
+            (basicAuthUsername == null || basicAuthPassword == null)) {
+            throw new IllegalStateException(
+                "Self API check '" + name + "' with Basic Auth requires username and password."
+            );
+        }
+        
+        if (authType == ApiAuthType.BEARER_TOKEN && bearerToken == null) {
+            throw new IllegalStateException(
+                "Self API check '" + name + "' with Bearer Token requires a token."
+            );
+        }
+        
+        if (validateAcl && allowedUserAgents.isEmpty()) {
+            throw new IllegalStateException(
+                "Self API check '" + name + "' with ACL validation requires at least one user agent."
+            );
+        }
+    }
+    
+    private String resolveEnvVariable(String value) {
+        if (value == null) return null;
+        if (value.startsWith("${") && value.endsWith("}")) {
+            String envVar = value.substring(2, value.length() - 1);
+            String envValue = System.getenv(envVar);
+            if (envValue != null) {
+                return envValue;
+            }
+            return System.getProperty(envVar, value);
+        }
+        return value;
+    }
+}
 
 
 
