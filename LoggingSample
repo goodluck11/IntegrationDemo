@@ -1,0 +1,2255 @@
+import org.slf4j.MDC;
+import java.util.UUID;
+
+public class CorrelationContext {
+    
+    public static final String CORRELATION_ID = "correlation_id";
+    public static final String REQUEST_ID = "request_id";
+    
+    // Start a new correlation (at API entry point)
+    public static String startCorrelation() {
+        String correlationId = "corr_" + UUID.randomUUID().toString().substring(0, 8);
+        MDC.put(CORRELATION_ID, correlationId);
+        return correlationId;
+    }
+    
+    // Use existing correlation ID (from header)
+    public static void setCorrelationId(String correlationId) {
+        MDC.put(CORRELATION_ID, correlationId);
+    }
+    
+    // Generate request ID for individual operations
+    public static String newRequestId() {
+        String requestId = "req_" + UUID.randomUUID().toString().substring(0, 8);
+        MDC.put(REQUEST_ID, requestId);
+        return requestId;
+    }
+    
+    public static String getCorrelationId() {
+        return MDC.get(CORRELATION_ID);
+    }
+    
+    public static void clear() {
+        MDC.clear();
+    }
+}
+
+
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+
+public class StructuredLogger {
+    
+    private static final ObjectMapper mapper = new ObjectMapper();
+    private final Logger log;
+    private final String component;
+    
+    public StructuredLogger(Class<?> clazz, String component) {
+        this.log = LoggerFactory.getLogger(clazz);
+        this.component = component;
+    }
+    
+    public static StructuredLogger forClass(Class<?> clazz, String component) {
+        return new StructuredLogger(clazz, component);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // DATABASE LOGGING
+    // ═══════════════════════════════════════════════════════════════
+    
+    public void dbQuery(String operation, String table, long durationMs) {
+        logEvent("db_query", builder -> {
+            builder.put("operation", operation);
+            builder.put("table", table);
+            builder.put("duration_ms", durationMs);
+        });
+    }
+    
+    public void dbQuery(String operation, String table, Object params, long durationMs) {
+        logEvent("db_query", builder -> {
+            builder.put("operation", operation);
+            builder.put("table", table);
+            builder.put("duration_ms", durationMs);
+            if (params != null) {
+                builder.put("params", maskSensitive(params.toString()));
+            }
+        });
+    }
+    
+    public void dbError(String operation, String table, Throwable error, long durationMs) {
+        logError("db_error", builder -> {
+            builder.put("operation", operation);
+            builder.put("table", table);
+            builder.put("duration_ms", durationMs);
+            builder.put("error", error.getClass().getSimpleName());
+            builder.put("error_message", error.getMessage());
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // EMAIL LOGGING
+    // ═══════════════════════════════════════════════════════════════
+    
+    public void emailSent(String to, String subject, long durationMs) {
+        logEvent("email_sent", builder -> {
+            builder.put("to", maskEmail(to));
+            builder.put("subject", subject);
+            builder.put("duration_ms", durationMs);
+        });
+    }
+    
+    public void emailError(String to, String subject, Throwable error) {
+        logError("email_error", builder -> {
+            builder.put("to", maskEmail(to));
+            builder.put("subject", subject);
+            builder.put("error", error.getClass().getSimpleName());
+            builder.put("error_message", error.getMessage());
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // CACHE LOGGING
+    // ═══════════════════════════════════════════════════════════════
+    
+    public void cacheHit(String cacheName, String key) {
+        logEvent("cache_hit", builder -> {
+            builder.put("cache", cacheName);
+            builder.put("key", key);
+        });
+    }
+    
+    public void cacheMiss(String cacheName, String key) {
+        logEvent("cache_miss", builder -> {
+            builder.put("cache", cacheName);
+            builder.put("key", key);
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // QUEUE/MESSAGING LOGGING
+    // ═══════════════════════════════════════════════════════════════
+    
+    public void messagePublished(String queue, String messageId) {
+        logEvent("message_published", builder -> {
+            builder.put("queue", queue);
+            builder.put("message_id", messageId);
+        });
+    }
+    
+    public void messageConsumed(String queue, String messageId, long durationMs) {
+        logEvent("message_consumed", builder -> {
+            builder.put("queue", queue);
+            builder.put("message_id", messageId);
+            builder.put("duration_ms", durationMs);
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // GENERIC TASK LOGGING
+    // ═══════════════════════════════════════════════════════════════
+    
+    public void taskStarted(String taskName) {
+        logEvent("task_started", builder -> {
+            builder.put("task", taskName);
+        });
+    }
+    
+    public void taskCompleted(String taskName, long durationMs) {
+        logEvent("task_completed", builder -> {
+            builder.put("task", taskName);
+            builder.put("duration_ms", durationMs);
+        });
+    }
+    
+    public void taskFailed(String taskName, Throwable error, long durationMs) {
+        logError("task_failed", builder -> {
+            builder.put("task", taskName);
+            builder.put("duration_ms", durationMs);
+            builder.put("error", error.getClass().getSimpleName());
+            builder.put("error_message", error.getMessage());
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // CORE LOGGING METHODS
+    // ═══════════════════════════════════════════════════════════════
+    
+    private void logEvent(String eventType, java.util.function.Consumer<ObjectNode> builder) {
+        try {
+            ObjectNode node = createBaseNode(eventType);
+            builder.accept(node);
+            log.info(mapper.writeValueAsString(node));
+        } catch (Exception e) {
+            log.info("type={} component={}", eventType, component);
+        }
+    }
+    
+    private void logError(String eventType, java.util.function.Consumer<ObjectNode> builder) {
+        try {
+            ObjectNode node = createBaseNode(eventType);
+            builder.accept(node);
+            log.error(mapper.writeValueAsString(node));
+        } catch (Exception e) {
+            log.error("type={} component={}", eventType, component);
+        }
+    }
+    
+    private ObjectNode createBaseNode(String eventType) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("timestamp", java.time.Instant.now().toString());
+        node.put("type", eventType);
+        node.put("component", component);
+        
+        String correlationId = MDC.get("correlation_id");
+        if (correlationId != null) {
+            node.put("correlation_id", correlationId);
+        }
+        
+        String requestId = MDC.get("request_id");
+        if (requestId != null) {
+            node.put("request_id", requestId);
+        }
+        
+        return node;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // MASKING HELPERS
+    // ═══════════════════════════════════════════════════════════════
+    
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) return "****";
+        int atIndex = email.indexOf("@");
+        if (atIndex <= 2) return "****" + email.substring(atIndex);
+        return email.substring(0, 2) + "****" + email.substring(atIndex);
+    }
+    
+    private String maskSensitive(String value) {
+        if (value == null) return null;
+        // Add your masking logic for sensitive fields
+        return value.replaceAll("(?i)(password|token|secret|cvv|pin)=[^,\\s]+", "$1=****");
+    }
+}
+
+
+@Repository
+public class OrderRepository {
+    
+    private final JdbcTemplate jdbc;
+    private final StructuredLogger slog = StructuredLogger.forClass(OrderRepository.class, "database");
+    
+    public Order findById(Long id) {
+        long start = System.currentTimeMillis();
+        try {
+            Order order = jdbc.queryForObject(
+                "SELECT * FROM orders WHERE id = ?", 
+                orderRowMapper, id);
+            
+            slog.dbQuery("SELECT", "orders", System.currentTimeMillis() - start);
+            return order;
+            
+        } catch (Exception e) {
+            slog.dbError("SELECT", "orders", e, System.currentTimeMillis() - start);
+            throw e;
+        }
+    }
+    
+    public Order save(Order order) {
+        long start = System.currentTimeMillis();
+        try {
+            jdbc.update("INSERT INTO orders ...", order.getAmount());
+            
+            slog.dbQuery("INSERT", "orders", System.currentTimeMillis() - start);
+            return order;
+            
+        } catch (Exception e) {
+            slog.dbError("INSERT", "orders", e, System.currentTimeMillis() - start);
+            throw e;
+        }
+    }
+}
+
+
+
+@Service
+public class EmailService {
+    
+    private final JavaMailSender mailSender;
+    private final StructuredLogger slog = StructuredLogger.forClass(EmailService.class, "email");
+    
+    public void sendOrderConfirmation(String to, Order order) {
+        long start = System.currentTimeMillis();
+        String subject = "Order Confirmed: " + order.getId();
+        
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            // ... build message
+            mailSender.send(message);
+            
+            slog.emailSent(to, subject, System.currentTimeMillis() - start);
+            
+        } catch (Exception e) {
+            slog.emailError(to, subject, e);
+            throw e;
+        }
+    }
+}
+
+
+@RestController
+public class OrderController {
+    
+    private final OrderService orderService;
+    private final StructuredLogger slog = StructuredLogger.forClass(OrderController.class, "api");
+    
+    @PostMapping("/orders")
+    public ResponseEntity<Order> createOrder(
+            @RequestHeader(value = "X-Correlation-ID", required = false) String correlationId,
+            @RequestBody CreateOrderRequest request) {
+        
+        // Start or continue correlation
+        if (correlationId != null) {
+            CorrelationContext.setCorrelationId(correlationId);
+        } else {
+            correlationId = CorrelationContext.startCorrelation();
+        }
+        
+        try {
+            slog.taskStarted("create_order");
+            long start = System.currentTimeMillis();
+            
+            Order order = orderService.createOrder(request);
+            
+            slog.taskCompleted("create_order", System.currentTimeMillis() - start);
+            
+            return ResponseEntity.ok()
+                .header("X-Correlation-ID", correlationId)
+                .body(order);
+                
+        } finally {
+            CorrelationContext.clear();
+        }
+    }
+}
+
+
+
+package com.cbq.restclient.logging;
+
+import org.slf4j.MDC;
+
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.function.Supplier;
+
+/**
+ * Fast correlation context management.
+ * 
+ * <h2>Usage</h2>
+ * <pre>{@code
+ * // In controller/entry point
+ * Ctx.start();  // Generates new correlation ID
+ * 
+ * // Or use existing (from header)
+ * Ctx.set(request.getHeader("X-Correlation-ID"));
+ * 
+ * // Get current correlation ID
+ * String cid = Ctx.cid();
+ * 
+ * // Run with context (auto-cleanup)
+ * Ctx.run(() -> {
+ *     // Your code here - correlation ID available
+ *     orderService.process();
+ * });
+ * 
+ * // Clear at end
+ * Ctx.clear();
+ * }</pre>
+ * 
+ * <h2>With async/threads</h2>
+ * <pre>{@code
+ * // Wrap runnable to propagate context
+ * executor.submit(Ctx.wrap(() -> {
+ *     // Correlation ID available in new thread
+ *     processAsync();
+ * }));
+ * }</pre>
+ */
+public final class Ctx {
+    
+    public static final String CORRELATION_ID = "correlation_id";
+    public static final String REQUEST_ID = "request_id";
+    
+    private Ctx() {}
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CORRELATION ID
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Start new correlation - returns generated ID */
+    public static String start() {
+        String cid = newId("cid_");
+        MDC.put(CORRELATION_ID, cid);
+        return cid;
+    }
+    
+    /** Set existing correlation ID */
+    public static void set(String correlationId) {
+        if (correlationId != null && !correlationId.isEmpty()) {
+            MDC.put(CORRELATION_ID, correlationId);
+        } else {
+            start();
+        }
+    }
+    
+    /** Get current correlation ID */
+    public static String cid() {
+        return MDC.get(CORRELATION_ID);
+    }
+    
+    /** Check if correlation exists */
+    public static boolean hasCid() {
+        return MDC.get(CORRELATION_ID) != null;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REQUEST ID (for individual operations within a correlation)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Generate new request ID */
+    public static String newReqId() {
+        String rid = newId("req_");
+        MDC.put(REQUEST_ID, rid);
+        return rid;
+    }
+    
+    /** Set request ID */
+    public static void setReqId(String requestId) {
+        MDC.put(REQUEST_ID, requestId);
+    }
+    
+    /** Get current request ID */
+    public static String rid() {
+        return MDC.get(REQUEST_ID);
+    }
+    
+    /** Clear request ID only */
+    public static void clearReqId() {
+        MDC.remove(REQUEST_ID);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CLEANUP
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Clear all context */
+    public static void clear() {
+        MDC.clear();
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RUN WITH CONTEXT (auto-cleanup)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Run with new correlation context (auto-cleanup) */
+    public static void run(Runnable task) {
+        String cid = start();
+        try {
+            task.run();
+        } finally {
+            clear();
+        }
+    }
+    
+    /** Run with existing correlation context (auto-cleanup) */
+    public static void run(String correlationId, Runnable task) {
+        set(correlationId);
+        try {
+            task.run();
+        } finally {
+            clear();
+        }
+    }
+    
+    /** Call with new correlation context (auto-cleanup) */
+    public static <T> T call(Supplier<T> task) {
+        start();
+        try {
+            return task.get();
+        } finally {
+            clear();
+        }
+    }
+    
+    /** Call with existing correlation context (auto-cleanup) */
+    public static <T> T call(String correlationId, Supplier<T> task) {
+        set(correlationId);
+        try {
+            return task.get();
+        } finally {
+            clear();
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ASYNC CONTEXT PROPAGATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Wrap runnable to propagate context to new thread */
+    public static Runnable wrap(Runnable task) {
+        String cid = cid();
+        String rid = rid();
+        return () -> {
+            if (cid != null) MDC.put(CORRELATION_ID, cid);
+            if (rid != null) MDC.put(REQUEST_ID, rid);
+            try {
+                task.run();
+            } finally {
+                clear();
+            }
+        };
+    }
+    
+    /** Wrap callable to propagate context to new thread */
+    public static <T> Callable<T> wrap(Callable<T> task) {
+        String cid = cid();
+        String rid = rid();
+        return () -> {
+            if (cid != null) MDC.put(CORRELATION_ID, cid);
+            if (rid != null) MDC.put(REQUEST_ID, rid);
+            try {
+                return task.call();
+            } finally {
+                clear();
+            }
+        };
+    }
+    
+    /** Wrap supplier to propagate context to new thread */
+    public static <T> Supplier<T> wrapSupplier(Supplier<T> task) {
+        String cid = cid();
+        String rid = rid();
+        return () -> {
+            if (cid != null) MDC.put(CORRELATION_ID, cid);
+            if (rid != null) MDC.put(REQUEST_ID, rid);
+            try {
+                return task.get();
+            } finally {
+                clear();
+            }
+        };
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UTILITY
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /** Generate short unique ID */
+    private static String newId(String prefix) {
+        return prefix + UUID.randomUUID().toString().substring(0, 8);
+    }
+}
+
+
+
+================================= NEW =================
+
+package com.cbq.restclient.logging;
+
+import com.cbq.restclient.config.LoggingConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Production-safe logging service with:
+ * - JSON format (Stripe-style, Splunk-friendly)
+ * - Pretty format (human-readable)
+ * - Correlation ID tracking across all calls
+ * - Max body size limits
+ * - Async logging (never blocks Netty)
+ * - Field masking for sensitive data
+ */
+public class LoggingService {
+    private static final Logger log = LoggerFactory.getLogger(LoggingService.class);
+    
+    private final LoggingConfig config;
+    private final ObjectMapper objectMapper;
+    private final Scheduler loggingScheduler;
+    
+    // Pre-computed lowercase sets for efficient lookup
+    private final Set<String> fieldsToMaskLower;
+    private final Set<String> fieldsToExcludeLower;
+    
+    // Pattern for masking in non-JSON content
+    private final Map<String, Pattern> maskPatterns = new HashMap<>();
+
+    public LoggingService(LoggingConfig config) {
+        this.config = config;
+        this.objectMapper = new ObjectMapper();
+        this.loggingScheduler = Schedulers.newBoundedElastic(2, 100, "cbq-logging");
+        
+        // Pre-compute lowercase sets at startup
+        this.fieldsToMaskLower = new HashSet<>();
+        for (String field : config.getFieldsToMask()) {
+            this.fieldsToMaskLower.add(field.toLowerCase());
+        }
+        
+        this.fieldsToExcludeLower = new HashSet<>();
+        for (String field : config.getFieldsToExclude()) {
+            this.fieldsToExcludeLower.add(field.toLowerCase());
+        }
+        
+        // Build mask patterns
+        for (String field : fieldsToMaskLower) {
+            String pattern = String.format("(?i)(\"%s\"\\s*:\\s*\")[^\"]*(\"|$)", field);
+            maskPatterns.put(field, Pattern.compile(pattern));
+        }
+    }
+
+    /**
+     * Logs request asynchronously
+     */
+    public Mono<Void> logRequestAsync(String requestId, String correlationId, String method, 
+                                       String uri, HttpHeaders headers, Object body, 
+                                       String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogRequest()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> logRequest(requestId, correlationId, method, uri, 
+                headers, body, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logRequestAsync(String requestId, String method, String uri,
+                                       HttpHeaders headers, Object body, String contentType) {
+        return logRequestAsync(requestId, null, method, uri, headers, body, contentType, "http");
+    }
+
+    /**
+     * Logs response asynchronously
+     */
+    public Mono<Void> logResponseAsync(String requestId, String correlationId, int status, 
+                                        HttpHeaders headers, String body, long durationMs, 
+                                        String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogResponse()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> logResponse(requestId, correlationId, status, headers, 
+                body, durationMs, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logResponseAsync(String requestId, int status, HttpHeaders headers,
+                                        String body, long durationMs, String contentType) {
+        return logResponseAsync(requestId, null, status, headers, body, durationMs, contentType, "http");
+    }
+
+    private void logRequest(String requestId, String correlationId, String method, String uri,
+                           HttpHeaders headers, Object body, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logRequestJson(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        } else {
+            logRequestPretty(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        }
+    }
+
+    private void logResponse(String requestId, String correlationId, int status, HttpHeaders headers,
+                            String body, long durationMs, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logResponseJson(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        } else {
+            logResponsePretty(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // JSON FORMAT (Stripe-style, Splunk-friendly)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestJson(String requestId, String correlationId, String method, String uri,
+                                HttpHeaders headers, Object body, String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", "request");
+            logNode.put("task_type", taskType);
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("method", method);
+            logNode.put("uri", uri);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        String value = maskHeaderValue(name, String.join(", ", values));
+                        headersNode.put(name, value);
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String bodyStr = formatBodyCompact(body);
+                String maskedBody = maskBodyCompact(bodyStr);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logResponseJson(String requestId, String correlationId, int status, 
+                                 HttpHeaders headers, String body, long durationMs, 
+                                 String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", "response");
+            logNode.put("task_type", taskType);
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("status", status);
+            logNode.put("duration_ms", durationMs);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        headersNode.put(name, String.join(", ", values));
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String maskedBody = maskBodyCompact(body);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRETTY FORMAT (Human-readable)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestPretty(String requestId, String correlationId, String method, String uri,
+                                  HttpHeaders headers, Object body, String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP REQUEST [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Method: ").append(method).append("\n");
+        sb.append("║ URI: ").append(uri).append("\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    value = maskHeaderValue(name, value);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String bodyStr = formatBody(body, contentType);
+            sb.append("║ Body:\n").append(bodyStr).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    private void logResponsePretty(String requestId, String correlationId, int status, 
+                                   HttpHeaders headers, String body, long durationMs, 
+                                   String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP RESPONSE [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Status: ").append(status).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String maskedBody = maskBody(body);
+            String truncatedBody = truncateBody(maskedBody);
+            sb.append("║ Body:\n").append(truncatedBody).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private boolean shouldLogBody(String contentType) {
+        return LoggingConfig.shouldLogContentType(contentType);
+    }
+
+    private String formatBody(Object body, String contentType) {
+        if (body == null) return "";
+        
+        String bodyStr;
+        if (body instanceof String) {
+            bodyStr = (String) body;
+        } else {
+            try {
+                bodyStr = objectMapper.writeValueAsString(body);
+            } catch (JsonProcessingException e) {
+                bodyStr = body.toString();
+            }
+        }
+        
+        return truncateBody(maskBody(bodyStr));
+    }
+    
+    private String formatBodyCompact(Object body) {
+        if (body == null) return "";
+        
+        if (body instanceof String) {
+            return (String) body;
+        }
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            return body.toString();
+        }
+    }
+
+    private String maskBody(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String maskBodyCompact(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writeValueAsString(node);  // Compact, no pretty print
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String applyPatternMasking(String body) {
+        String masked = body;
+        for (Map.Entry<String, Pattern> entry : maskPatterns.entrySet()) {
+            Matcher matcher = entry.getValue().matcher(masked);
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    entry.getKey().toLowerCase(), config.getDefaultVisibleChars());
+            masked = matcher.replaceAll("$1" + generateMask(visibleChars) + "$2");
+        }
+        return masked;
+    }
+
+    private void maskJsonNode(JsonNode node) {
+        if (node == null) return;
+        
+        if (node.isObject()) {
+            ObjectNode objNode = (ObjectNode) node;
+            Iterator<String> fieldNames = objNode.fieldNames();
+            List<String> names = new ArrayList<>();
+            fieldNames.forEachRemaining(names::add);
+            
+            for (String fieldName : names) {
+                String fieldNameLower = fieldName.toLowerCase();
+                
+                if (fieldsToExcludeLower.contains(fieldNameLower)) {
+                    objNode.remove(fieldName);
+                    continue;
+                }
+                
+                boolean shouldMask = fieldsToMaskLower.contains(fieldNameLower) ||
+                        shouldMaskPartial(fieldNameLower);
+                
+                if (shouldMask) {
+                    int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                            fieldNameLower, config.getDefaultVisibleChars());
+                    JsonNode valueNode = objNode.get(fieldName);
+                    if (valueNode != null && valueNode.isTextual()) {
+                        String value = valueNode.asText();
+                        objNode.put(fieldName, maskValue(value, visibleChars));
+                    } else if (valueNode != null && !valueNode.isNull()) {
+                        objNode.put(fieldName, generateMask(0));
+                    }
+                } else {
+                    maskJsonNode(objNode.get(fieldName));
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode element : node) {
+                maskJsonNode(element);
+            }
+        }
+    }
+    
+    private boolean shouldMaskPartial(String fieldNameLower) {
+        for (String maskField : fieldsToMaskLower) {
+            if (fieldNameLower.contains(maskField) || maskField.contains(fieldNameLower)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String maskValue(String value, int visibleChars) {
+        if (value == null || value.length() <= visibleChars * 2) {
+            return generateMask(0);
+        }
+        
+        String mask = String.valueOf(config.getMaskSymbol()).repeat(
+                Math.min(8, value.length() - visibleChars * 2));
+        
+        if (visibleChars > 0) {
+            return value.substring(0, visibleChars) + mask + 
+                   value.substring(value.length() - visibleChars);
+        }
+        return mask;
+    }
+
+    private String generateMask(int visibleChars) {
+        return String.valueOf(config.getMaskSymbol()).repeat(8);
+    }
+
+    private String maskHeaderValue(String headerName, String value) {
+        String lowerName = headerName.toLowerCase();
+        if (fieldsToMaskLower.contains(lowerName) || 
+            lowerName.contains("authorization") || 
+            lowerName.contains("token") ||
+            lowerName.contains("api-key") ||
+            lowerName.contains("apikey")) {
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    lowerName, config.getDefaultVisibleChars());
+            return maskValue(value, visibleChars);
+        }
+        return value;
+    }
+
+    private String truncateBody(String body) {
+        if (body == null) return "";
+        
+        int maxSize = config.getMaxBodySize();
+        if (body.length() <= maxSize) {
+            return body;
+        }
+        
+        return body.substring(0, maxSize) + "...[TRUNCATED]";
+    }
+
+    public void logError(String requestId, String correlationId, String method, String uri, 
+                        Throwable error, long durationMs) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            try {
+                ObjectNode logNode = objectMapper.createObjectNode();
+                logNode.put("timestamp", Instant.now().toString());
+                logNode.put("service", config.getServiceName());
+                logNode.put("type", "error");
+                logNode.put("request_id", requestId);
+                if (correlationId != null) {
+                    logNode.put("correlation_id", correlationId);
+                }
+                logNode.put("method", method);
+                logNode.put("uri", uri);
+                logNode.put("duration_ms", durationMs);
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+                
+                log.error(objectMapper.writeValueAsString(logNode));
+            } catch (Exception e) {
+                log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+            }
+        } else {
+            log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+        }
+    }
+    
+    // Backward compatible
+    public void logError(String requestId, String method, String uri, Throwable error, long durationMs) {
+        logError(requestId, null, method, uri, error, durationMs);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TASK LOGGING (DB, Email, etc.)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Log a generic task (DB call, email, file operation, etc.)
+     * 
+     * @param correlationId Shared ID across all calls in workflow
+     * @param taskType Type: "db", "email", "file", "cache", etc.
+     * @param operation Operation name: "save", "find", "send", etc.
+     * @param target Target: table name, email recipient, file path, etc.
+     * @param data Optional data to log (will be masked)
+     * @param durationMs How long it took
+     * @param success Whether it succeeded
+     * @param error Error if failed (null if success)
+     */
+    public void logTask(String correlationId, String taskType, String operation, 
+                       String target, Object data, long durationMs, 
+                       boolean success, Throwable error) {
+        if (!config.isEnabled()) return;
+        
+        String taskId = "task_" + UUID.randomUUID().toString().substring(0, 8);
+        
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logTaskJson(taskId, correlationId, taskType, operation, target, data, durationMs, success, error);
+        } else {
+            logTaskPretty(taskId, correlationId, taskType, operation, target, data, durationMs, success, error);
+        }
+    }
+
+    private void logTaskJson(String taskId, String correlationId, String taskType, 
+                            String operation, String target, Object data, 
+                            long durationMs, boolean success, Throwable error) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", success ? "task" : "task_error");
+            logNode.put("task_type", taskType);
+            logNode.put("task_id", taskId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("operation", operation);
+            logNode.put("target", target);
+            logNode.put("duration_ms", durationMs);
+            logNode.put("success", success);
+            
+            if (data != null) {
+                String dataStr = formatBodyCompact(data);
+                String maskedData = maskBodyCompact(dataStr);
+                try {
+                    JsonNode dataNode = objectMapper.readTree(maskedData);
+                    logNode.set("data", dataNode);
+                } catch (Exception e) {
+                    logNode.put("data", maskedData);
+                }
+            }
+            
+            if (error != null) {
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+            }
+            
+            if (success) {
+                log.info(objectMapper.writeValueAsString(logNode));
+            } else {
+                log.error(objectMapper.writeValueAsString(logNode));
+            }
+        } catch (Exception e) {
+            log.warn("Failed to create task JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logTaskPretty(String taskId, String correlationId, String taskType,
+                              String operation, String target, Object data,
+                              long durationMs, boolean success, Throwable error) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ TASK [").append(taskType.toUpperCase()).append("] - ")
+          .append(success ? "SUCCESS" : "FAILED").append("\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Task ID: ").append(taskId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Operation: ").append(operation).append("\n");
+        sb.append("║ Target: ").append(target).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (data != null) {
+            String dataStr = formatBodyCompact(data);
+            String maskedData = maskBodyCompact(dataStr);
+            sb.append("║ Data: ").append(truncateBody(maskedData)).append("\n");
+        }
+        
+        if (error != null) {
+            sb.append("║ Error: ").append(error.getClass().getSimpleName())
+              .append(" - ").append(error.getMessage()).append("\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        if (success) {
+            log.info(sb.toString());
+        } else {
+            log.error(sb.toString());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONVENIENCE METHODS FOR COMMON TASKS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Log a database operation
+     */
+    public void logDb(String correlationId, String operation, String table, 
+                     Object data, long durationMs) {
+        logTask(correlationId, "db", operation, table, data, durationMs, true, null);
+    }
+
+    public void logDbError(String correlationId, String operation, String table, 
+                          Object data, long durationMs, Throwable error) {
+        logTask(correlationId, "db", operation, table, data, durationMs, false, error);
+    }
+
+    /**
+     * Log an email operation
+     */
+    public void logEmail(String correlationId, String operation, String recipient, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "email", operation, recipient, data, durationMs, true, null);
+    }
+
+    public void logEmailError(String correlationId, String operation, String recipient, 
+                             Object data, long durationMs, Throwable error) {
+        logTask(correlationId, "email", operation, recipient, data, durationMs, false, error);
+    }
+
+    /**
+     * Log a cache operation
+     */
+    public void logCache(String correlationId, String operation, String key, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "cache", operation, key, data, durationMs, true, null);
+    }
+
+    /**
+     * Log a queue/message operation
+     */
+    public void logQueue(String correlationId, String operation, String queue, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "queue", operation, queue, data, durationMs, true, null);
+    }
+
+    /**
+     * Log a file operation
+     */
+    public void logFile(String correlationId, String operation, String path, 
+                       long durationMs) {
+        logTask(correlationId, "file", operation, path, null, durationMs, true, null);
+    }
+
+    public void shutdown() {
+        loggingScheduler.dispose();
+    }
+}
+
+
+=================== WORKFLOW UPDATE ====================
+
+package com.cbq.restclient.core;
+
+import com.cbq.restclient.model.CBQResponse;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+/**
+ * Advanced execution patterns for complex workflows.
+ * 
+ * <p>Supports:</p>
+ * <ul>
+ *   <li>Sequential then fire-and-forget parallel</li>
+ *   <li>Sequential with rollback on failure</li>
+ *   <li>Mixed sync/async database calls</li>
+ *   <li>Fire-and-forget with error handling</li>
+ *   <li>Compensating transactions</li>
+ * </ul>
+ * 
+ * <h2>Usage:</h2>
+ * <pre>{@code
+ * CBQWorkflow.start()
+ *     .step(() -> client.get().uri("/status").retrieve(Status.class))
+ *     .step(status -> client.post().uri("/process").bodyValue(status).retrieve(Result.class))
+ *     .onSuccess(result -> fireAndForget(
+ *         () -> client.post().uri("/notify").retrieve(Void.class),
+ *         () -> client.post().uri("/audit").retrieve(Void.class)
+ *     ))
+ *     .onFailure(error -> client.post().uri("/rollback").retrieve(Void.class))
+ *     .execute();
+ * }</pre>
+ */
+@Slf4j
+public class CBQWorkflow<T> {
+
+    private static final Scheduler ASYNC_SCHEDULER = Schedulers.newBoundedElastic(
+            10, 1000, "cbq-workflow-async");
+
+    private Mono<T> chain;
+    private final List<Mono<?>> fireAndForgetTasks = new ArrayList<>();
+    private Function<Throwable, Mono<?>> failureHandler;
+    private Consumer<Throwable> fireAndForgetErrorHandler = error -> 
+            log.error("Fire-and-forget task failed: {}", error.getMessage());
+
+    private CBQWorkflow(Mono<T> initial) {
+        this.chain = initial;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FACTORY METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Start a new workflow
+     */
+    public static CBQWorkflow<Void> start() {
+        return new CBQWorkflow<>(Mono.empty());
+    }
+
+    /**
+     * Start workflow with initial value
+     */
+    public static <T> CBQWorkflow<T> startWith(T value) {
+        return new CBQWorkflow<>(Mono.just(value));
+    }
+
+    /**
+     * Start workflow with initial Mono
+     */
+    public static <T> CBQWorkflow<T> startWith(Mono<T> mono) {
+        return new CBQWorkflow<>(mono);
+    }
+
+    /**
+     * Start workflow with HTTP call
+     */
+    public static <T> CBQWorkflow<T> startWith(Supplier<Mono<CBQResponse<T>>> httpCall) {
+        return new CBQWorkflow<>(httpCall.get().map(CBQResponse::getBody));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEQUENTIAL STEPS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Add a sequential HTTP step (waits for completion)
+     */
+    public <R> CBQWorkflow<R> step(Supplier<Mono<CBQResponse<R>>> httpCall) {
+        Mono<R> newChain = this.chain.then(httpCall.get().map(CBQResponse::getBody));
+        return new CBQWorkflow<>(newChain);
+    }
+
+    /**
+     * Add a sequential HTTP step that uses previous result
+     */
+    public <R> CBQWorkflow<R> step(Function<T, Mono<CBQResponse<R>>> httpCall) {
+        Mono<R> newChain = this.chain.flatMap(prev -> httpCall.apply(prev).map(CBQResponse::getBody));
+        CBQWorkflow<R> workflow = new CBQWorkflow<>(newChain);
+        workflow.fireAndForgetTasks.addAll(this.fireAndForgetTasks);
+        workflow.failureHandler = (Function<Throwable, Mono<?>>) (Object) this.failureHandler;
+        workflow.fireAndForgetErrorHandler = this.fireAndForgetErrorHandler;
+        return workflow;
+    }
+
+    /**
+     * Add a sequential step with raw Mono (for DB calls, etc.)
+     */
+    public <R> CBQWorkflow<R> stepMono(Supplier<Mono<R>> monoCall) {
+        Mono<R> newChain = this.chain.then(monoCall.get());
+        return new CBQWorkflow<>(newChain);
+    }
+
+    /**
+     * Add a sequential step with raw Mono that uses previous result
+     */
+    public <R> CBQWorkflow<R> stepMono(Function<T, Mono<R>> monoCall) {
+        Mono<R> newChain = this.chain.flatMap(monoCall);
+        CBQWorkflow<R> workflow = new CBQWorkflow<>(newChain);
+        workflow.fireAndForgetTasks.addAll(this.fireAndForgetTasks);
+        workflow.failureHandler = (Function<Throwable, Mono<?>>) (Object) this.failureHandler;
+        workflow.fireAndForgetErrorHandler = this.fireAndForgetErrorHandler;
+        return workflow;
+    }
+
+    /**
+     * Add a SYNC blocking step (e.g., sync DB call) - runs on bounded elastic
+     */
+    public <R> CBQWorkflow<R> stepSync(Supplier<R> syncCall) {
+        Mono<R> newChain = this.chain.then(
+                Mono.fromCallable(syncCall::get).subscribeOn(Schedulers.boundedElastic())
+        );
+        return new CBQWorkflow<>(newChain);
+    }
+
+    /**
+     * Add a SYNC blocking step that uses previous result
+     */
+    public <R> CBQWorkflow<R> stepSync(Function<T, R> syncCall) {
+        Mono<R> newChain = this.chain.flatMap(prev ->
+                Mono.fromCallable(() -> syncCall.apply(prev)).subscribeOn(Schedulers.boundedElastic())
+        );
+        CBQWorkflow<R> workflow = new CBQWorkflow<>(newChain);
+        workflow.fireAndForgetTasks.addAll(this.fireAndForgetTasks);
+        workflow.failureHandler = (Function<Throwable, Mono<?>>) (Object) this.failureHandler;
+        workflow.fireAndForgetErrorHandler = this.fireAndForgetErrorHandler;
+        return workflow;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP THAT CONTINUES ON ERROR
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Add a step that continues even if it fails (error is logged but doesn't stop workflow)
+     */
+    public <R> CBQWorkflow<T> stepContinueOnError(Function<T, Mono<CBQResponse<R>>> httpCall) {
+        Mono<T> newChain = this.chain.flatMap(prev ->
+                httpCall.apply(prev)
+                        .map(CBQResponse::getBody)
+                        .doOnError(e -> log.warn("Step failed but continuing: {}", e.getMessage()))
+                        .onErrorResume(e -> Mono.empty())
+                        .then(Mono.just(prev))
+        );
+        CBQWorkflow<T> workflow = new CBQWorkflow<>(newChain);
+        workflow.fireAndForgetTasks.addAll(this.fireAndForgetTasks);
+        workflow.failureHandler = this.failureHandler;
+        workflow.fireAndForgetErrorHandler = this.fireAndForgetErrorHandler;
+        return workflow;
+    }
+
+    /**
+     * Add a step that continues on error and executes a fallback
+     */
+    public <R> CBQWorkflow<T> stepContinueOnError(
+            Function<T, Mono<CBQResponse<R>>> httpCall,
+            Consumer<Throwable> onError) {
+        Mono<T> newChain = this.chain.flatMap(prev ->
+                httpCall.apply(prev)
+                        .map(CBQResponse::getBody)
+                        .doOnError(onError)
+                        .onErrorResume(e -> Mono.empty())
+                        .then(Mono.just(prev))
+        );
+        CBQWorkflow<T> workflow = new CBQWorkflow<>(newChain);
+        workflow.fireAndForgetTasks.addAll(this.fireAndForgetTasks);
+        workflow.failureHandler = this.failureHandler;
+        workflow.fireAndForgetErrorHandler = this.fireAndForgetErrorHandler;
+        return workflow;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FIRE AND FORGET
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Add fire-and-forget HTTP calls to execute after success (non-blocking)
+     */
+    public CBQWorkflow<T> fireAndForget(Supplier<? extends Mono<? extends CBQResponse<?>>>... httpCalls) {
+        for (Supplier<? extends Mono<? extends CBQResponse<?>>> call : httpCalls) {
+            fireAndForgetTasks.add(call.get().then());
+        }
+        return this;
+    }
+
+    /**
+     * Add fire-and-forget Monos (for DB calls, notifications, etc.)
+     */
+    public CBQWorkflow<T> fireAndForgetMono(Supplier<? extends Mono<?>>... monoCalls) {
+        for (Supplier<? extends Mono<?>> call : monoCalls) {
+            fireAndForgetTasks.add(call.get().then());
+        }
+        return this;
+    }
+
+    /**
+     * Add fire-and-forget sync calls (run on bounded elastic scheduler)
+     */
+    public CBQWorkflow<T> fireAndForgetSync(Runnable... syncCalls) {
+        for (Runnable call : syncCalls) {
+            fireAndForgetTasks.add(Mono.fromRunnable(call).subscribeOn(ASYNC_SCHEDULER));
+        }
+        return this;
+    }
+
+    /**
+     * Add fire-and-forget that uses the result
+     */
+    public CBQWorkflow<T> fireAndForgetWith(Function<T, Mono<?>> task) {
+        // Store for later execution with result
+        Mono<T> newChain = this.chain.doOnNext(result ->
+                task.apply(result)
+                        .subscribeOn(ASYNC_SCHEDULER)
+                        .doOnError(fireAndForgetErrorHandler)
+                        .onErrorResume(e -> Mono.empty())
+                        .subscribe()
+        );
+        return new CBQWorkflow<>(newChain);
+    }
+
+    /**
+     * Set custom error handler for fire-and-forget tasks
+     */
+    public CBQWorkflow<T> onFireAndForgetError(Consumer<Throwable> handler) {
+        this.fireAndForgetErrorHandler = handler;
+        return this;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ERROR HANDLING / ROLLBACK
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Set failure handler (rollback, compensation, etc.)
+     */
+    public CBQWorkflow<T> onFailure(Function<Throwable, Mono<?>> handler) {
+        this.failureHandler = handler;
+        return this;
+    }
+
+    /**
+     * Set failure handler with HTTP call
+     */
+    public CBQWorkflow<T> onFailure(Supplier<? extends Mono<? extends CBQResponse<?>>> httpCall) {
+        this.failureHandler = error -> httpCall.get().then();
+        return this;
+    }
+
+    /**
+     * Set sync failure handler (e.g., DB update)
+     */
+    public CBQWorkflow<T> onFailureSync(Consumer<Throwable> handler) {
+        this.failureHandler = error -> Mono.fromRunnable(() -> handler.accept(error))
+                .subscribeOn(Schedulers.boundedElastic())
+                .then();
+        return this;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXECUTION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Execute the workflow and block for result
+     */
+    public T execute() {
+        return executeAsync().block();
+    }
+
+    /**
+     * Execute the workflow and block with timeout
+     */
+    public T execute(Duration timeout) {
+        return executeAsync().block(timeout);
+    }
+
+    /**
+     * Execute the workflow asynchronously
+     */
+    public Mono<T> executeAsync() {
+        Mono<T> workflow = chain;
+
+        // Add failure handler
+        if (failureHandler != null) {
+            workflow = workflow.onErrorResume(error -> {
+                log.error("Workflow failed, executing failure handler: {}", error.getMessage());
+                return failureHandler.apply(error)
+                        .then(Mono.error(error));  // Re-throw after handling
+            });
+        }
+
+        // Trigger fire-and-forget tasks on success
+        if (!fireAndForgetTasks.isEmpty()) {
+            workflow = workflow.doOnSuccess(result -> {
+                log.debug("Triggering {} fire-and-forget tasks", fireAndForgetTasks.size());
+                Flux.merge(fireAndForgetTasks)
+                        .subscribeOn(ASYNC_SCHEDULER)
+                        .doOnError(fireAndForgetErrorHandler)
+                        .onErrorResume(e -> Mono.empty())
+                        .subscribe();
+            });
+        }
+
+        return workflow;
+    }
+
+    /**
+     * Execute and ignore result (for workflows that only have side effects)
+     */
+    public void executeAndForget() {
+        executeAsync()
+                .doOnError(e -> log.error("Workflow failed: {}", e.getMessage()))
+                .onErrorResume(e -> Mono.empty())
+                .subscribe();
+    }
+}
+
+
+================== NEW LOGGER ===============
+
+package com.cbq.restclient.logging;
+
+import com.cbq.restclient.config.LoggingConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Production-safe logging service with:
+ * - JSON format (Stripe-style, Splunk-friendly)
+ * - Pretty format (human-readable)
+ * - Correlation ID tracking across all calls
+ * - Max body size limits
+ * - Async logging (never blocks Netty)
+ * - Field masking for sensitive data
+ */
+public class LoggingService {
+    private static final Logger log = LoggerFactory.getLogger(LoggingService.class);
+    
+    private final LoggingConfig config;
+    private final ObjectMapper objectMapper;
+    private final Scheduler loggingScheduler;
+    
+    // Pre-computed lowercase sets for efficient lookup
+    private final Set<String> fieldsToMaskLower;
+    private final Set<String> fieldsToExcludeLower;
+    
+    // Pattern for masking in non-JSON content
+    private final Map<String, Pattern> maskPatterns = new HashMap<>();
+
+    public LoggingService(LoggingConfig config) {
+        this.config = config;
+        this.objectMapper = new ObjectMapper();
+        this.loggingScheduler = Schedulers.newBoundedElastic(2, 100, "cbq-logging");
+        
+        // Pre-compute lowercase sets at startup
+        this.fieldsToMaskLower = new HashSet<>();
+        for (String field : config.getFieldsToMask()) {
+            this.fieldsToMaskLower.add(field.toLowerCase());
+        }
+        
+        this.fieldsToExcludeLower = new HashSet<>();
+        for (String field : config.getFieldsToExclude()) {
+            this.fieldsToExcludeLower.add(field.toLowerCase());
+        }
+        
+        // Build mask patterns
+        for (String field : fieldsToMaskLower) {
+            String pattern = String.format("(?i)(\"%s\"\\s*:\\s*\")[^\"]*(\"|$)", field);
+            maskPatterns.put(field, Pattern.compile(pattern));
+        }
+    }
+
+    /**
+     * Logs request asynchronously
+     */
+    public Mono<Void> logRequestAsync(String requestId, String correlationId, String method, 
+                                       String uri, HttpHeaders headers, Object body, 
+                                       String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogRequest()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> logRequest(requestId, correlationId, method, uri, 
+                headers, body, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logRequestAsync(String requestId, String method, String uri,
+                                       HttpHeaders headers, Object body, String contentType) {
+        return logRequestAsync(requestId, null, method, uri, headers, body, contentType, "http");
+    }
+
+    /**
+     * Logs response asynchronously
+     */
+    public Mono<Void> logResponseAsync(String requestId, String correlationId, int status, 
+                                        HttpHeaders headers, String body, long durationMs, 
+                                        String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogResponse()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> logResponse(requestId, correlationId, status, headers, 
+                body, durationMs, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logResponseAsync(String requestId, int status, HttpHeaders headers,
+                                        String body, long durationMs, String contentType) {
+        return logResponseAsync(requestId, null, status, headers, body, durationMs, contentType, "http");
+    }
+
+    private void logRequest(String requestId, String correlationId, String method, String uri,
+                           HttpHeaders headers, Object body, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logRequestJson(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        } else {
+            logRequestPretty(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        }
+    }
+
+    private void logResponse(String requestId, String correlationId, int status, HttpHeaders headers,
+                            String body, long durationMs, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logResponseJson(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        } else {
+            logResponsePretty(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // JSON FORMAT (Stripe-style, Splunk-friendly)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestJson(String requestId, String correlationId, String method, String uri,
+                                HttpHeaders headers, Object body, String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", "request");
+            logNode.put("task_type", taskType);
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("method", method);
+            logNode.put("uri", uri);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        String value = maskHeaderValue(name, String.join(", ", values));
+                        headersNode.put(name, value);
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String bodyStr = formatBodyCompact(body);
+                String maskedBody = maskBodyCompact(bodyStr);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logResponseJson(String requestId, String correlationId, int status, 
+                                 HttpHeaders headers, String body, long durationMs, 
+                                 String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", "response");
+            logNode.put("task_type", taskType);
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("status", status);
+            logNode.put("duration_ms", durationMs);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        headersNode.put(name, String.join(", ", values));
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String maskedBody = maskBodyCompact(body);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRETTY FORMAT (Human-readable)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestPretty(String requestId, String correlationId, String method, String uri,
+                                  HttpHeaders headers, Object body, String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP REQUEST [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Method: ").append(method).append("\n");
+        sb.append("║ URI: ").append(uri).append("\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    value = maskHeaderValue(name, value);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String bodyStr = formatBody(body, contentType);
+            sb.append("║ Body:\n").append(bodyStr).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    private void logResponsePretty(String requestId, String correlationId, int status, 
+                                   HttpHeaders headers, String body, long durationMs, 
+                                   String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP RESPONSE [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Status: ").append(status).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String maskedBody = maskBody(body);
+            String truncatedBody = truncateBody(maskedBody);
+            sb.append("║ Body:\n").append(truncatedBody).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private boolean shouldLogBody(String contentType) {
+        return LoggingConfig.shouldLogContentType(contentType);
+    }
+
+    private String formatBody(Object body, String contentType) {
+        if (body == null) return "";
+        
+        String bodyStr;
+        if (body instanceof String) {
+            bodyStr = (String) body;
+        } else {
+            try {
+                bodyStr = objectMapper.writeValueAsString(body);
+            } catch (JsonProcessingException e) {
+                bodyStr = body.toString();
+            }
+        }
+        
+        return truncateBody(maskBody(bodyStr));
+    }
+    
+    private String formatBodyCompact(Object body) {
+        if (body == null) return "";
+        
+        if (body instanceof String) {
+            return (String) body;
+        }
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            return body.toString();
+        }
+    }
+
+    private String maskBody(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String maskBodyCompact(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writeValueAsString(node);  // Compact, no pretty print
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String applyPatternMasking(String body) {
+        String masked = body;
+        for (Map.Entry<String, Pattern> entry : maskPatterns.entrySet()) {
+            Matcher matcher = entry.getValue().matcher(masked);
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    entry.getKey().toLowerCase(), config.getDefaultVisibleChars());
+            masked = matcher.replaceAll("$1" + generateMask(visibleChars) + "$2");
+        }
+        return masked;
+    }
+
+    private void maskJsonNode(JsonNode node) {
+        if (node == null) return;
+        
+        if (node.isObject()) {
+            ObjectNode objNode = (ObjectNode) node;
+            Iterator<String> fieldNames = objNode.fieldNames();
+            List<String> names = new ArrayList<>();
+            fieldNames.forEachRemaining(names::add);
+            
+            for (String fieldName : names) {
+                String fieldNameLower = fieldName.toLowerCase();
+                
+                if (fieldsToExcludeLower.contains(fieldNameLower)) {
+                    objNode.remove(fieldName);
+                    continue;
+                }
+                
+                boolean shouldMask = fieldsToMaskLower.contains(fieldNameLower) ||
+                        shouldMaskPartial(fieldNameLower);
+                
+                if (shouldMask) {
+                    int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                            fieldNameLower, config.getDefaultVisibleChars());
+                    JsonNode valueNode = objNode.get(fieldName);
+                    if (valueNode != null && valueNode.isTextual()) {
+                        String value = valueNode.asText();
+                        objNode.put(fieldName, maskValue(value, visibleChars));
+                    } else if (valueNode != null && !valueNode.isNull()) {
+                        objNode.put(fieldName, generateMask(0));
+                    }
+                } else {
+                    maskJsonNode(objNode.get(fieldName));
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode element : node) {
+                maskJsonNode(element);
+            }
+        }
+    }
+    
+    private boolean shouldMaskPartial(String fieldNameLower) {
+        for (String maskField : fieldsToMaskLower) {
+            if (fieldNameLower.contains(maskField) || maskField.contains(fieldNameLower)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String maskValue(String value, int visibleChars) {
+        if (value == null || value.length() <= visibleChars * 2) {
+            return generateMask(0);
+        }
+        
+        String mask = String.valueOf(config.getMaskSymbol()).repeat(
+                Math.min(8, value.length() - visibleChars * 2));
+        
+        if (visibleChars > 0) {
+            return value.substring(0, visibleChars) + mask + 
+                   value.substring(value.length() - visibleChars);
+        }
+        return mask;
+    }
+
+    private String generateMask(int visibleChars) {
+        return String.valueOf(config.getMaskSymbol()).repeat(8);
+    }
+
+    private String maskHeaderValue(String headerName, String value) {
+        String lowerName = headerName.toLowerCase();
+        if (fieldsToMaskLower.contains(lowerName) || 
+            lowerName.contains("authorization") || 
+            lowerName.contains("token") ||
+            lowerName.contains("api-key") ||
+            lowerName.contains("apikey")) {
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    lowerName, config.getDefaultVisibleChars());
+            return maskValue(value, visibleChars);
+        }
+        return value;
+    }
+
+    private String truncateBody(String body) {
+        if (body == null) return "";
+        
+        int maxSize = config.getMaxBodySize();
+        if (body.length() <= maxSize) {
+            return body;
+        }
+        
+        return body.substring(0, maxSize) + "...[TRUNCATED]";
+    }
+
+    public void logError(String requestId, String correlationId, String method, String uri, 
+                        Throwable error, long durationMs) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            try {
+                ObjectNode logNode = objectMapper.createObjectNode();
+                logNode.put("timestamp", Instant.now().toString());
+                logNode.put("service", config.getServiceName());
+                logNode.put("type", "error");
+                logNode.put("request_id", requestId);
+                if (correlationId != null) {
+                    logNode.put("correlation_id", correlationId);
+                }
+                logNode.put("method", method);
+                logNode.put("uri", uri);
+                logNode.put("duration_ms", durationMs);
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+                
+                log.error(objectMapper.writeValueAsString(logNode));
+            } catch (Exception e) {
+                log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+            }
+        } else {
+            log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+        }
+    }
+    
+    // Backward compatible
+    public void logError(String requestId, String method, String uri, Throwable error, long durationMs) {
+        logError(requestId, null, method, uri, error, durationMs);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TASK LOGGING (DB, Email, etc.)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Log a generic task (DB call, email, file operation, etc.)
+     * 
+     * @param correlationId Shared ID across all calls in workflow
+     * @param taskType Type: "db", "email", "file", "cache", etc.
+     * @param operation Operation name: "save", "find", "send", etc.
+     * @param target Target: table name, email recipient, file path, etc.
+     * @param data Optional data to log (will be masked)
+     * @param durationMs How long it took
+     * @param success Whether it succeeded
+     * @param error Error if failed (null if success)
+     */
+    public void logTask(String correlationId, String taskType, String operation, 
+                       String target, Object data, long durationMs, 
+                       boolean success, Throwable error) {
+        if (!config.isEnabled()) return;
+        
+        String taskId = "task_" + UUID.randomUUID().toString().substring(0, 8);
+        
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logTaskJson(taskId, correlationId, taskType, operation, target, data, durationMs, success, error);
+        } else {
+            logTaskPretty(taskId, correlationId, taskType, operation, target, data, durationMs, success, error);
+        }
+    }
+
+    private void logTaskJson(String taskId, String correlationId, String taskType, 
+                            String operation, String target, Object data, 
+                            long durationMs, boolean success, Throwable error) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", success ? "task" : "task_error");
+            logNode.put("task_type", taskType);
+            logNode.put("task_id", taskId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("operation", operation);
+            logNode.put("target", target);
+            logNode.put("duration_ms", durationMs);
+            logNode.put("success", success);
+            
+            if (data != null) {
+                String dataStr = formatBodyCompact(data);
+                String maskedData = maskBodyCompact(dataStr);
+                try {
+                    JsonNode dataNode = objectMapper.readTree(maskedData);
+                    logNode.set("data", dataNode);
+                } catch (Exception e) {
+                    logNode.put("data", maskedData);
+                }
+            }
+            
+            if (error != null) {
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+            }
+            
+            if (success) {
+                log.info(objectMapper.writeValueAsString(logNode));
+            } else {
+                log.error(objectMapper.writeValueAsString(logNode));
+            }
+        } catch (Exception e) {
+            log.warn("Failed to create task JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logTaskPretty(String taskId, String correlationId, String taskType,
+                              String operation, String target, Object data,
+                              long durationMs, boolean success, Throwable error) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ TASK [").append(taskType.toUpperCase()).append("] - ")
+          .append(success ? "SUCCESS" : "FAILED").append("\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Task ID: ").append(taskId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Operation: ").append(operation).append("\n");
+        sb.append("║ Target: ").append(target).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (data != null) {
+            String dataStr = formatBodyCompact(data);
+            String maskedData = maskBodyCompact(dataStr);
+            sb.append("║ Data: ").append(truncateBody(maskedData)).append("\n");
+        }
+        
+        if (error != null) {
+            sb.append("║ Error: ").append(error.getClass().getSimpleName())
+              .append(" - ").append(error.getMessage()).append("\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        if (success) {
+            log.info(sb.toString());
+        } else {
+            log.error(sb.toString());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONVENIENCE METHODS FOR COMMON TASKS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Log a database operation
+     */
+    public void logDb(String correlationId, String operation, String table, 
+                     Object data, long durationMs) {
+        logTask(correlationId, "db", operation, table, data, durationMs, true, null);
+    }
+
+    public void logDbError(String correlationId, String operation, String table, 
+                          Object data, long durationMs, Throwable error) {
+        logTask(correlationId, "db", operation, table, data, durationMs, false, error);
+    }
+
+    /**
+     * Log an email operation
+     */
+    public void logEmail(String correlationId, String operation, String recipient, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "email", operation, recipient, data, durationMs, true, null);
+    }
+
+    public void logEmailError(String correlationId, String operation, String recipient, 
+                             Object data, long durationMs, Throwable error) {
+        logTask(correlationId, "email", operation, recipient, data, durationMs, false, error);
+    }
+
+    /**
+     * Log a cache operation
+     */
+    public void logCache(String correlationId, String operation, String key, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "cache", operation, key, data, durationMs, true, null);
+    }
+
+    /**
+     * Log a queue/message operation
+     */
+    public void logQueue(String correlationId, String operation, String queue, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "queue", operation, queue, data, durationMs, true, null);
+    }
+
+    /**
+     * Log a file operation
+     */
+    public void logFile(String correlationId, String operation, String path, 
+                       long durationMs) {
+        logTask(correlationId, "file", operation, path, null, durationMs, true, null);
+    }
+
+    public void shutdown() {
+        loggingScheduler.dispose();
+    }
+}
+
+
