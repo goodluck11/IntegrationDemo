@@ -1,0 +1,74 @@
+/**
+ * Add a step that continues on error, with success callback to capture result
+ */
+public <R> CBQWorkflow<T> stepContinueOnError(
+        Function<T, Mono<R>> call,
+        Consumer<R> onSuccess,
+        Consumer<Throwable> onError) {
+    Mono<T> newChain = this.chain.flatMap(prev ->
+            call.apply(prev)
+                    .doOnNext(onSuccess)
+                    .doOnError(onError)
+                    .onErrorResume(e -> Mono.empty())
+                    .then(Mono.just(prev))
+    );
+    CBQWorkflow<T> workflow = new CBQWorkflow<>(newChain);
+    workflow.fireAndForgetTasks.addAll(this.fireAndForgetTasks);
+    workflow.failureHandler = this.failureHandler;
+    workflow.fireAndForgetErrorHandler = this.fireAndForgetErrorHandler;
+    return workflow;
+}
+
+
+
+public OrderResponse createOrder(CreateOrderRequest request) {
+    
+    AtomicReference<String> notificationId = new AtomicReference<>("");
+    
+    Order order = CBQWorkflow
+        .startWith(() -> client.post()
+            .uri("/orders")
+            .bodyValue(request)
+            .retrieve(Order.class))
+        
+        .stepContinueOnError(
+            o -> notificationRepository.save(new Notification(o.getId())),
+            notification -> notificationId.set(notification.getId()),
+            error -> log.warn("Notification failed: {}", error.getMessage())
+        )
+        .execute();
+    
+    return new OrderResponse(order.getId(), order.getAmount(), notificationId.get());
+}
+
+
+public TransferResponse processTransfer(TransferRequest request) {
+    
+    AtomicReference<String> receiptId = new AtomicReference<>("");
+    
+    TransferResult result = CBQWorkflow
+        .startWith(() -> client.post()
+            .uri("/transfers")
+            .bodyValue(request)
+            .retrieve(TransferResult.class))
+        
+        .stepContinueOnError(
+            transfer -> client.post()
+                .uri("/receipts")
+                .bodyValue(new ReceiptRequest(transfer.getId()))
+                .retrieveBody(Receipt.class),
+            receipt -> receiptId.set(receipt.getId()),
+            error -> log.warn("Receipt generation failed: {}", error.getMessage())
+        )
+        
+        // This runs regardless of receipt success/failure
+        .step(transfer -> client.post()
+            .uri("/transfers/complete")
+            .bodyValue(new CompleteRequest(transfer.getId()))
+            .retrieve(TransferResult.class))
+        
+        .execute();
+    
+    return new TransferResponse(result.getId(), result.getAmount(), receiptId.get());
+}
+
