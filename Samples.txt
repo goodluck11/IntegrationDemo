@@ -1,55 +1,54 @@
-# FLUX HTTP Client - Comprehensive Guide
+# CBQ Flux Client
 
-A production-ready HTTP client library with resilience patterns, observability, and advanced workflow capabilities for Java/Spring applications.
-
----
-
-## Table of Contents
-
-1. [Quick Start](#1-quick-start)
-2. [Client Configuration](#2-client-configuration)
-3. [Basic HTTP Operations](#3-basic-http-operations)
-4. [Request Customization](#4-request-customization)
-5. [Response Handling](#5-response-handling)
-6. [Parallel Execution](#6-parallel-execution)
-7. [Sequential Execution](#7-sequential-execution)
-8. [FluxHttpWorkflow - Advanced Workflows](#8-fluxhttpworkflow---advanced-workflows)
-9. [Error Handling & Custom Error Messages](#9-error-handling--custom-error-messages)
-10. [Resilience Patterns](#10-resilience-patterns)
-11. [Logging & Masking](#11-logging--masking)
-12. [SSL/TLS Configuration](#12-ssltls-configuration)
-13. [Client Pool for Different Timeouts](#13-client-pool-for-different-timeouts)
-14. [Filters](#14-filters)
-15. [Email Notifications](#15-email-notifications)
-16. [Spring Boot Integration](#16-spring-boot-integration)
-17. [Real-World Use Cases](#17-real-world-use-cases)
+A production-ready HTTP client library for Java/Spring applications with built-in resilience, observability, and workflow capabilities.
 
 ---
 
-## 1. Quick Start
+## 📦 Maven Dependency
 
-### Minimal Setup
+```xml
+<dependency>
+    <groupId>com.cbq.flux</groupId>
+    <artifactId>cbq-flux-client</artifactId>
+    <version>2.0.0</version>
+</dependency>
+```
+
+### Optional Dependencies (add only what you need)
+
+```xml
+<!-- Spring Mail - for email notifications -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-mail</artifactId>
+</dependency>
+```
+
+---
+
+## 🚀 Quick Start
+
+### Simplest Setup
 
 ```java
-// Simple client with defaults
 FluxHttpClient client = FluxHttpClientBuilder.builder()
     .baseUrl("https://api.example.com")
     .build();
 
-// Make a GET request
+// GET request
 User user = client.get()
     .uri("/users/1")
     .retrieveBody(User.class)
     .block();
 
-// Make a POST request
-FluxResponse<User> response = client.post()
-    .uri("/users")
-    .bodyValue(new CreateUserRequest("John", "john@example.com"))
-    .retrieve(User.class)
+// POST request
+Order order = client.post()
+    .uri("/orders")
+    .bodyValue(new CreateOrderRequest("item-1", 2))
+    .retrieveBody(Order.class)
     .block();
 
-// Don't forget to shutdown when done
+// Don't forget to shutdown
 client.shutdown();
 ```
 
@@ -58,65 +57,57 @@ client.shutdown();
 ```java
 FluxHttpClient client = FluxHttpClientBuilder.builder("payment-service")
     .baseUrl("https://api.payment.com")
+    
+    // Timeouts
     .timeouts(TimeoutConfig.custom()
         .connection(Duration.ofSeconds(5))
         .read(Duration.ofSeconds(30))
-        .write(Duration.ofSeconds(30))
         .response(Duration.ofSeconds(60)))
-    .header("X-API-Version", "2.0")
-    .addRequestFilter(Filters.bearerToken(() -> tokenService.getToken()))
+    
+    // Resilience (retry, circuit breaker)
     .resilience(ResilienceConfig.custom()
         .retry(RetryConfig.custom()
             .maxAttempts(3)
-            .backoffStrategy(BackoffStrategy.EXPONENTIAL_WITH_JITTER))
+            .waitDuration(Duration.ofMillis(500)))
         .circuitBreaker(CircuitBreakerConfig.custom()
             .failureRate(50)
             .openStateWait(Duration.ofSeconds(30))))
+    
+    // Logging (JSON format for Splunk)
     .logging(LoggingConfig.custom()
         .logAll()
-        .maskFields("cardNumber", "cvv", "pin", "password"))
-    .build();
-```
-
----
-
-## 2. Client Configuration
-
-### 2.1 Timeout Configuration
-
-```java
-TimeoutConfig timeouts = TimeoutConfig.custom()
-    .connection(Duration.ofSeconds(5))    // Time to establish connection
-    .read(Duration.ofSeconds(30))         // Time to read data from socket
-    .write(Duration.ofSeconds(30))        // Time to write data to socket
-    .response(Duration.ofSeconds(60));    // Total time for complete response
-
-// Pre-defined profiles
-TimeoutConfig.fast();      // 2s conn, 5s read, 10s response
-TimeoutConfig.defaults();  // 5s conn, 30s read, 60s response
-TimeoutConfig.slow();      // 10s conn, 2min read, 5min response
-```
-
-### 2.2 Default Headers
-
-```java
-FluxHttpClientBuilder.builder()
-    .header("X-Client-Id", "my-service")
+        .jsonFormat()
+        .serviceName("payment-service")
+        .maskFields("cardNumber", "cvv", "password"))
+    
+    // Default headers
     .header("X-API-Version", "2.0")
-    .headers(map -> {
-        map.put("X-Tenant-Id", "tenant-123");
-        map.put("X-Region", "us-east-1");
-    })
+    
+    // Auth filter
+    .addRequestFilter(Filters.bearerToken(() -> tokenService.getToken()))
+    
     .build();
 ```
 
-**Note:** Per-request headers override global headers with the same name.
+---
+
+## 📖 Table of Contents
+
+1. [HTTP Methods](#1-http-methods)
+2. [Request Options](#2-request-options)
+3. [Response Handling](#3-response-handling)
+4. [Parallel Execution](#4-parallel-execution)
+5. [Sequential Execution](#5-sequential-execution)
+6. [FluxHttpWorkflow - Advanced Workflows](#6-fluxhttpworkflow---advanced-workflows)
+7. [Resilience (Retry, Circuit Breaker)](#7-resilience)
+8. [Logging & Masking](#8-logging--masking)
+9. [Error Handling](#9-error-handling)
+10. [Filters](#10-filters)
+11. [Real-World Examples](#11-real-world-examples)
 
 ---
 
-## 3. Basic HTTP Operations
-
-### 3.1 All HTTP Methods
+## 1. HTTP Methods
 
 ```java
 // GET
@@ -141,63 +132,36 @@ client.head().uri("/users/1").retrieve(Void.class);
 client.options().uri("/users").retrieve(String.class);
 ```
 
-### 3.2 URI Templates
+### URI with Variables
 
 ```java
-// Simple placeholder
-client.get().uri("/users/{}", 123).retrieve(User.class);
+// Single variable
+client.get().uri("/users/{}", userId).retrieve(User.class);
 
-// Multiple placeholders
+// Multiple variables
 client.get().uri("/users/{}/orders/{}", userId, orderId).retrieve(Order.class);
-
-// Query parameters (manual)
-client.get().uri("/users?page=" + page + "&size=" + size).retrieve(UserList.class);
-```
-
-### 3.3 Response Types
-
-```java
-// Full response with metadata
-FluxResponse<User> response = client.get().uri("/users/1").retrieve(User.class).block();
-User body = response.getBody();
-HttpStatus status = response.getStatus();
-HttpHeaders headers = response.getHeaders();
-long durationMs = response.getDurationMs();
-String requestId = response.getRequestId();
-
-// Body only (simpler)
-User user = client.get().uri("/users/1").retrieveBody(User.class).block();
-
-// String response
-String json = client.get().uri("/users/1").retrieve().block().getBody();
-
-// Void response (for DELETE, etc.)
-client.delete().uri("/users/1").retrieve(Void.class).block();
-
-// Flux for streaming
-Flux<User> users = client.get().uri("/users/stream").retrieveFlux(User.class);
 ```
 
 ---
 
-## 4. Request Customization
+## 2. Request Options
 
-### 4.1 Headers
+### Headers
 
 ```java
 client.post()
-    .uri("/payments")
+    .uri("/orders")
     .header("X-Idempotency-Key", UUID.randomUUID().toString())
     .header("X-Request-Source", "mobile-app")
     .headers(h -> {
-        h.add("X-Custom-Header", "value1");
-        h.add("X-Another-Header", "value2");
+        h.add("X-Custom-1", "value1");
+        h.add("X-Custom-2", "value2");
     })
-    .bodyValue(payment)
-    .retrieve(PaymentResult.class);
+    .bodyValue(order)
+    .retrieve(Order.class);
 ```
 
-### 4.2 Content Type
+### Content Type
 
 ```java
 // JSON (default)
@@ -209,151 +173,138 @@ client.post()
     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
     .bodyValue("username=john&password=secret")
     .retrieve(LoginResult.class);
-
-// XML
-client.post()
-    .uri("/soap")
-    .contentType(MediaType.APPLICATION_XML)
-    .bodyValue(xmlString)
-    .retrieve(String.class);
 ```
 
-### 4.3 Per-Request Overrides
+### Per-Request Timeout Override
 
 ```java
-// Override response timeout for slow endpoint
+// Override timeout for slow endpoint
 client.post()
     .uri("/reports/generate")
-    .bodyValue(reportRequest)
+    .bodyValue(request)
     .override(o -> o
-        .responseTimeout(Duration.ofMinutes(5))  // Longer timeout
-        .retryEnabled(false)                      // Disable retry
-        .circuitBreakerEnabled(false))            // Disable circuit breaker
+        .responseTimeout(Duration.ofMinutes(5))
+        .retryEnabled(false)
+        .circuitBreakerEnabled(false))
     .retrieve(Report.class);
 ```
 
 ---
 
-## 5. Response Handling
+## 3. Response Handling
 
-### 5.1 Blocking vs Reactive
+### Full Response (with metadata)
 
 ```java
-// Blocking (for traditional code)
+FluxResponse<User> response = client.get()
+    .uri("/users/1")
+    .retrieve(User.class)
+    .block();
+
+User user = response.getBody();
+int status = response.getStatus().value();
+HttpHeaders headers = response.getHeaders();
+long duration = response.getDurationMs();
+String requestId = response.getRequestId();
+```
+
+### Body Only (simpler)
+
+```java
+User user = client.get()
+    .uri("/users/1")
+    .retrieveBody(User.class)
+    .block();
+```
+
+### Blocking vs Reactive
+
+```java
+// Blocking (traditional code)
 User user = client.get().uri("/users/1").retrieveBody(User.class).block();
 
 // Blocking with timeout
 User user = client.get().uri("/users/1").retrieveBody(User.class)
-    .block(Duration.ofSeconds(30));
+    .block(Duration.ofSeconds(10));
 
-// Reactive (for WebFlux)
+// Reactive (WebFlux)
 Mono<User> userMono = client.get().uri("/users/1").retrieveBody(User.class);
 
 // Subscribe
 client.get().uri("/users/1").retrieveBody(User.class)
     .subscribe(
-        user -> log.info("Got user: {}", user),
+        user -> log.info("Got user: {}", user.getName()),
         error -> log.error("Failed: {}", error.getMessage())
     );
 ```
 
-### 5.2 Response Metadata
+### Streaming (Flux)
 
 ```java
-FluxResponse<User> response = client.get().uri("/users/1").retrieve(User.class).block();
+Flux<Event> events = client.get()
+    .uri("/events/stream")
+    .retrieveFlux(Event.class);
 
-// Check status
-if (response.getStatus().is2xxSuccessful()) {
-    User user = response.getBody();
-}
-
-// Access headers
-String etag = response.getHeaders().getFirst("ETag");
-String contentType = response.getHeaders().getFirst("Content-Type");
-
-// Timing info
-log.info("Request {} took {}ms", response.getRequestId(), response.getDurationMs());
+events.subscribe(event -> processEvent(event));
 ```
 
 ---
 
-## 6. Parallel Execution
+## 4. Parallel Execution
 
-Execute multiple requests concurrently for better performance.
+Execute multiple requests at the same time.
 
-### 6.1 Basic Parallel
+### Basic Parallel
 
 ```java
-// Execute 3 requests in parallel, wait for all
 FluxParallelResult<Object> result = client.parallel(
     client.get().uri("/users/1").retrieve(User.class),
     client.get().uri("/orders/recent").retrieve(OrderList.class),
     client.get().uri("/notifications").retrieve(NotificationList.class)
-).waitAll().execute().block();
+).execute().block();
 
-// Access results by index
+// Get results by index
 User user = (User) result.getResponses().get(0).getBody();
 OrderList orders = (OrderList) result.getResponses().get(1).getBody();
-NotificationList notifications = (NotificationList) result.getResponses().get(2).getBody();
-
-log.info("Total time: {}ms", result.getTotalDurationMs());
 ```
 
-### 6.2 Parallel Strategies
+### Parallel Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `waitAll()` | Wait for ALL requests (default) |
+| `failFast()` | Stop on FIRST failure |
+| `partialSuccess()` | Continue even if some fail |
 
 ```java
-// WAIT_ALL: Wait for all requests to complete (default)
-// All requests run regardless of individual failures
+// WAIT_ALL - Wait for all, fail if any fails
 client.parallel(req1, req2, req3)
     .waitAll()
     .execute();
 
-// FAIL_FAST: Stop immediately on first failure
-// Remaining requests are cancelled
+// FAIL_FAST - Stop immediately on first failure
 client.parallel(req1, req2, req3)
     .failFast()
     .execute();
 
-// PARTIAL_SUCCESS: Continue even if some fail
-// Collect both successes and failures
+// PARTIAL_SUCCESS - Get what you can
 FluxParallelResult<User> result = client.parallel(req1, req2, req3)
     .partialSuccess()
     .execute()
     .block();
 
-// Check for partial failures
+// Check for errors
 if (result.hasErrors()) {
     result.getErrors().forEach((index, error) -> 
         log.warn("Request {} failed: {}", index, error.getMessage()));
 }
-
-// Process successful responses
-result.getResponses().forEach(response -> 
-    processUser(response.getBody()));
-```
-
-### 6.3 Typed Parallel Results
-
-```java
-// When all requests return the same type
-FluxParallelResult<User> result = client.parallel(
-    client.get().uri("/users/1").retrieve(User.class),
-    client.get().uri("/users/2").retrieve(User.class),
-    client.get().uri("/users/3").retrieve(User.class)
-).waitAll().execute().block();
-
-List<User> users = result.getResponses().stream()
-    .map(FluxResponse::getBody)
-    .collect(Collectors.toList());
 ```
 
 ---
 
-## 7. Sequential Execution
+## 5. Sequential Execution
 
-Execute requests in sequence, passing data between steps.
-
-### 7.1 Basic Sequence
+Execute requests in order, passing data from one to the next.
 
 ```java
 // Step 1 result feeds into Step 2
@@ -367,167 +318,237 @@ Order order = client.sequence()
     .block();
 ```
 
-### 7.2 Multi-Step Sequence
+---
+
+## 6. FluxHttpWorkflow - Advanced Workflows
+
+The most powerful feature for complex operations.
+
+### Quick Reference
+
+| Method | Waits? | Has Result? | Use For |
+|--------|--------|-------------|---------|
+| `step()` | ✅ Yes | ✅ Yes | HTTP calls |
+| `stepMono()` | ✅ Yes | ✅ Yes | Reactive DB (R2DBC) |
+| `stepSync()` | ✅ Yes | ✅ Yes | Blocking DB (JPA/JDBC) |
+| `stepContinueOnError()` | ✅ Yes | ✅ Yes | Non-critical steps |
+| `fireAndForget()` | ❌ No | ❌ No | Background HTTP |
+| `fireAndForgetMono()` | ❌ No | ❌ No | Background reactive |
+| `fireAndForgetSync()` | ❌ No | ❌ No | Background blocking |
+| `fireAndForgetWith()` | ❌ No | ✅ Yes | Background with result |
+| `onFailure()` | - | ❌ No | HTTP rollback |
+| `onFailureSync()` | - | ✅ Yes | Blocking rollback |
+
+### 6.1 Basic Workflow
 
 ```java
-// Authenticate → Get User → Create Order → Send Notification
-String notificationId = client.sequence()
-    // Step 1: Authenticate
-    .then(() -> client.post()
-        .uri("/auth/token")
-        .bodyValue(credentials)
-        .retrieve(AuthToken.class))
-    // Step 2: Get user profile using token
-    .then((AuthToken token) -> client.get()
-        .uri("/users/me")
-        .header("Authorization", "Bearer " + token.getAccessToken())
-        .retrieve(User.class))
-    // Step 3: Create order for user
-    .then((User user) -> client.post()
+Order order = FluxHttpWorkflow
+    // Step 1: Validate
+    .startWith(() -> client.post()
+        .uri("/validate")
+        .bodyValue(request)
+        .retrieve(ValidationResult.class))
+    
+    // Step 2: Create order (uses validation result)
+    .step(validation -> client.post()
         .uri("/orders")
-        .bodyValue(new CreateOrderRequest(user.getId(), items))
+        .bodyValue(new OrderRequest(validation.getAccountId()))
         .retrieve(Order.class))
-    // Step 4: Send notification
-    .then((Order order) -> client.post()
-        .uri("/notifications")
-        .bodyValue(new NotificationRequest(order.getId(), "Order created"))
+    
+    .execute();
+```
+
+### 6.2 With Database Calls
+
+```java
+// Reactive DB (R2DBC)
+Order order = FluxHttpWorkflow
+    .startWith(() -> client.post().uri("/orders").retrieve(Order.class))
+    .stepMono(order -> reactiveOrderRepo.save(order))  // Reactive DB
+    .execute();
+
+// Blocking DB (JPA/JDBC)
+Order order = FluxHttpWorkflow
+    .startWith(() -> client.post().uri("/orders").retrieve(Order.class))
+    .stepSync(order -> jpaOrderRepo.save(order))  // Blocking DB
+    .execute();
+```
+
+### 6.3 Fire-and-Forget (Background Tasks)
+
+```java
+Order order = FluxHttpWorkflow
+    // Main: Create order (waits)
+    .startWith(() -> client.post()
+        .uri("/orders")
+        .bodyValue(request)
+        .retrieve(Order.class))
+    
+    // Background: These don't block the response
+    .fireAndForget(
+        () -> client.post().uri("/audit").bodyValue(audit).retrieve(Void.class),
+        () -> client.post().uri("/analytics").bodyValue(event).retrieve(Void.class)
+    )
+    
+    // Background with result access
+    .fireAndForgetWith(order -> client.post()
+        .uri("/email/send")
+        .bodyValue(new EmailRequest(order.getCustomerEmail(), "Order confirmed"))
+        .retrieve(Void.class))
+    
+    // Background DB save
+    .fireAndForgetSync(() -> auditRepo.save(new AuditLog("order_created")))
+    
+    .execute();  // Returns immediately after order created
+```
+
+### 6.4 Continue on Error (Non-Critical Steps)
+
+**Use Case:** Step 2 fails but you still want Step 1's result.
+
+```java
+TransferResult result = FluxHttpWorkflow
+    // Step 1: Main transfer (critical)
+    .startWith(() -> client.post()
+        .uri("/transfers")
+        .bodyValue(request)
+        .retrieve(TransferResult.class))
+    
+    // Step 2: Partner notification (non-critical)
+    // If fails → logs error, continues with Step 1 result
+    .stepContinueOnError(transfer -> client.post()
+        .uri("/partners/notify")
+        .bodyValue(new PartnerNotification(transfer.getId()))
         .retrieve(NotificationResult.class))
-    .<NotificationResult>execute()
-    .map(NotificationResult::getId)
-    .block();
+    
+    // Step 3: Update status (runs even if Step 2 failed)
+    .step(transfer -> client.post()
+        .uri("/transfers/complete")
+        .bodyValue(new CompleteRequest(transfer.getId()))
+        .retrieve(TransferResult.class))
+    
+    .execute();
+```
+
+### More stepContinueOnError Examples
+
+#### Example 1: HTTP Call with Inline Result Capture
+
+Create order, then create notification. If notification fails, continue with empty ID.
+```java
+public OrderResponse createOrder(CreateOrderRequest request) {
+    
+    AtomicReference<String> notificationId = new AtomicReference<>("");
+    
+    Order order = FluxHttpWorkflow
+        .startWith(() -> client.post()
+            .uri("/orders")
+            .bodyValue(request)
+            .retrieve(Order.class))
+        
+        .stepContinueOnError(o -> 
+            client.post()
+                .uri("/notifications")
+                .bodyValue(new NotificationRequest(o.getId()))
+                .retrieve(Notification.class)
+                .doOnNext(resp -> notificationId.set(resp.getBody().getId()))
+        )
+        .execute();
+    
+    return new OrderResponse(order.getId(), order.getAmount(), notificationId.get());
+}
 ```
 
 ---
 
-## 8. FluxHttpWorkflow - Advanced Workflows
+#### Example 2: DB Call with Success/Error Callbacks
 
-The most powerful feature for complex multi-step operations with error handling, rollback, and fire-and-forget capabilities.
-
-### 8.1 Workflow Methods Overview
-
-| Method | Description | Blocking? | Waits? |
-|--------|-------------|-----------|--------|
-| `step()` | HTTP call, sequential | No | Yes |
-| `stepMono()` | Any Mono (DB, etc.) | No | Yes |
-| `stepSync()` | Blocking call (JPA/JDBC) | Yes | Yes |
-| `stepContinueOnError()` | Continue even if fails | No | Yes |
-| `fireAndForget()` | HTTP calls in background | No | No |
-| `fireAndForgetMono()` | Monos in background | No | No |
-| `fireAndForgetSync()` | Blocking calls in background | Yes | No |
-| `fireAndForgetWith()` | Background with result access | No | No |
-| `onFailure()` | Error handler (HTTP) | No | - |
-| `onFailureSync()` | Error handler (blocking) | Yes | - |
-
-### 8.2 Basic Workflow
-
+Create order, then save notification to DB. If DB fails, continue with empty ID.
 ```java
-PaymentResult result = FluxHttpWorkflow.start(client)
-    // Step 1: Validate account
-    .step(c -> c.post()
-        .uri("/accounts/validate")
-        .bodyValue(new ValidateRequest(accountId))
-        .retrieve(ValidationResult.class))
-    // Step 2: Process payment (uses Step 1 result)
-    .step((c, validation) -> c.post()
-        .uri("/payments/process")
-        .bodyValue(new PaymentRequest(validation.getAccountId(), amount))
-        .retrieve(PaymentResult.class))
-    .execute();  // Blocks and returns result
+public OrderResponse createOrder(CreateOrderRequest request) {
+    
+    AtomicReference<String> notificationId = new AtomicReference<>("");
+    
+    Order order = FluxHttpWorkflow
+        .startWith(() -> client.post()
+            .uri("/orders")
+            .bodyValue(request)
+            .retrieve(Order.class))
+        
+        .stepContinueOnError(
+            o -> notificationRepository.save(new Notification(o.getId())),
+            notification -> notificationId.set(notification.getId()),
+            error -> log.warn("Notification failed: {}", error.getMessage())
+        )
+        .execute();
+    
+    return new OrderResponse(order.getId(), order.getAmount(), notificationId.get());
+}
 ```
 
-### 8.3 Workflow with Database Integration
+---
 
+#### Example 3: Continue to Next Step After Optional Step
+
+Create transfer, try to generate receipt, then complete transfer regardless of receipt result.
 ```java
-// Using reactive database (R2DBC)
-OrderResult result = FluxHttpWorkflow.start(client)
-    // Step 1: Save to DB (reactive)
-    .stepMono(() -> orderRepository.save(order))
-    // Step 2: Call external API
-    .step((c, savedOrder) -> c.post()
-        .uri("/fulfillment/process")
-        .bodyValue(new FulfillmentRequest(savedOrder.getId()))
-        .retrieve(FulfillmentResult.class))
-    // Step 3: Update DB with result (reactive)
-    .stepMono(fulfillment -> orderRepository.updateStatus(
-        fulfillment.getOrderId(), "FULFILLED"))
-    .execute();
-
-// Using blocking database (JPA/JDBC)
-OrderResult result = FluxHttpWorkflow.start(client)
-    // Step 1: Save to DB (blocking - runs on boundedElastic)
-    .stepSync(() -> {
-        Order saved = orderRepository.save(order);
-        return saved;
-    })
-    // Step 2: Call external API
-    .step((c, savedOrder) -> c.post()
-        .uri("/fulfillment/process")
-        .bodyValue(new FulfillmentRequest(savedOrder.getId()))
-        .retrieve(FulfillmentResult.class))
-    // Step 3: Update DB (blocking)
-    .stepSync(fulfillment -> {
-        orderRepository.updateStatus(fulfillment.getOrderId(), "FULFILLED");
-        return fulfillment;
-    })
-    .execute();
+public TransferResponse processTransfer(TransferRequest request) {
+    
+    AtomicReference<String> receiptId = new AtomicReference<>("");
+    
+    TransferResult result = FluxHttpWorkflow
+        .startWith(() -> client.post()
+            .uri("/transfers")
+            .bodyValue(request)
+            .retrieve(TransferResult.class))
+        
+        .stepContinueOnError(
+            transfer -> client.post()
+                .uri("/receipts")
+                .bodyValue(new ReceiptRequest(transfer.getId()))
+                .retrieveBody(Receipt.class),
+            receipt -> receiptId.set(receipt.getId()),
+            error -> log.warn("Receipt generation failed: {}", error.getMessage())
+        )
+        
+        // This runs regardless of receipt success/failure
+        .step(transfer -> client.post()
+            .uri("/transfers/complete")
+            .bodyValue(new CompleteRequest(transfer.getId()))
+            .retrieve(TransferResult.class))
+        
+        .execute();
+    
+    return new TransferResponse(result.getId(), result.getAmount(), receiptId.get());
+}
 ```
 
-### 8.4 Fire-and-Forget (Background Tasks)
+**With custom error handler:**
 
 ```java
-PaymentResult result = FluxHttpWorkflow.start(client)
-    // Main flow: Process payment
-    .step(c -> c.post()
-        .uri("/payments/process")
-        .bodyValue(paymentRequest)
-        .retrieve(PaymentResult.class))
-    
-    // Fire-and-forget: These run in background after success
-    // Don't block the response, don't fail the workflow if they fail
-    .fireAndForget(
-        () -> client.post().uri("/audit/log").bodyValue(auditEntry).retrieve(Void.class),
-        () -> client.post().uri("/analytics/track").bodyValue(event).retrieve(Void.class)
-    )
-    
-    // Fire-and-forget with access to result
-    .fireAndForgetWith(payment -> 
-        client.post()
-            .uri("/notifications/send")
-            .bodyValue(new NotificationRequest(payment.getId(), "Payment successful"))
-            .retrieve(Void.class))
-    
-    // Fire-and-forget DB operation (blocking, runs on separate thread)
-    .fireAndForgetSync(() -> {
-        auditRepository.save(new AuditLog("payment_processed", paymentId));
-    })
-    
-    // Fire-and-forget reactive DB
-    .fireAndForgetMono(() -> 
-        analyticsRepository.incrementCounter("payments_processed"))
-    
-    .execute();
-
-// Result returned immediately after payment processed
-// Background tasks continue running
+.stepContinueOnError(
+    transfer -> client.post().uri("/notify").retrieve(Void.class),
+    error -> log.warn("Notification failed: {}", error.getMessage())
+)
 ```
 
-### 8.5 Error Handling with Rollback
+### 6.5 Rollback on Failure
 
 ```java
-PaymentResult result = FluxHttpWorkflow.start(client)
+PaymentResult result = FluxHttpWorkflow
     // Step 1: Reserve funds
-    .step(c -> c.post()
+    .startWith(() -> client.post()
         .uri("/accounts/reserve")
         .bodyValue(new ReserveRequest(accountId, amount))
         .retrieve(ReservationResult.class))
     
     // Step 2: Process payment
-    .step((c, reservation) -> c.post()
+    .step(reservation -> client.post()
         .uri("/payments/execute")
         .bodyValue(new ExecuteRequest(reservation.getId()))
         .retrieve(PaymentResult.class))
     
-    // On ANY failure: Release the reserved funds
+    // If ANY step fails: Release funds
     .onFailure(() -> client.post()
         .uri("/accounts/release")
         .bodyValue(new ReleaseRequest(accountId))
@@ -536,604 +557,339 @@ PaymentResult result = FluxHttpWorkflow.start(client)
     .execute();
 ```
 
-### 8.6 Step Continue On Error (Non-Critical Steps)
+### 6.6 Deep Chain with Partial Results
+
+**Scenario:** Chain of 5 calls. Return results of successful calls even if later ones fail.
 
 ```java
-TransferResult result = FluxHttpWorkflow.start(client)
-    // Step 1: Main transfer (critical)
-    .step(c -> c.post()
-        .uri("/transfers/execute")
-        .bodyValue(transferRequest)
-        .retrieve(TransferResult.class))
+public ChainResult processChain(Request request) {
+    ChainResult result = new ChainResult();
     
-    // Step 2: Secondary notification (non-critical)
-    // If this fails, workflow continues with previous result
-    .stepContinueOnError(
-        (c, transfer) -> c.post()
-            .uri("/partners/notify")
-            .bodyValue(new PartnerNotification(transfer.getId()))
-            .retrieve(NotificationResult.class),
-        (error, transfer) -> {
-            log.warn("Partner notification failed: {}", error.getMessage());
-            // Could save to retry queue here
-            return transfer;  // Return previous result to continue
-        }
-    )
-    
-    // Step 3: Update status (continues even if Step 2 failed)
-    .step((c, transfer) -> c.post()
-        .uri("/transfers/complete")
-        .bodyValue(new CompleteRequest(transfer.getId()))
-        .retrieve(TransferResult.class))
-    
-    .execute();
-```
-
-### 8.7 Complex Real-World Workflow: Card Payment with Reversal
-
-```java
-public PostingResult processCardPayment(CardPaymentRequest request) {
-    return FluxHttpWorkflow.start(fluxClient)
-        // Step 1: Check card status
-        .step(c -> c.get()
-            .uri("/cards/{}/status", request.getCardId())
-            .retrieve(CardStatus.class))
+    try {
+        // Step 1: First API call
+        FirstResult first = FluxHttpWorkflow
+            .startWith(() -> client.post()
+                .uri("/step1")
+                .bodyValue(request)
+                .retrieve(FirstResult.class))
+            .execute();
+        result.setFirst(first);  // Save result
         
-        // Step 2: Validate card is active
-        .step((c, status) -> {
-            if (!status.isActive()) {
-                throw new CardInactiveException(request.getCardId());
-            }
-            return c.post()
-                .uri("/cards/{}/details", request.getCardId())
-                .bodyValue(new CardDetailsRequest(request.getPin()))
-                .retrieve(CardDetails.class);
-        })
-        
-        // Step 3: Check balance
-        .step((c, card) -> c.post()
-            .uri("/accounts/{}/balance", card.getAccountId())
-            .bodyValue(new BalanceCheckRequest(request.getAmount()))
-            .retrieve(BalanceResult.class))
-        
-        // Step 4: Execute posting
-        .step((c, balance) -> {
-            if (balance.getAvailable().compareTo(request.getAmount()) < 0) {
-                throw new InsufficientFundsException(balance.getAvailable());
-            }
-            return c.post()
-                .uri("/postings/execute")
-                .bodyValue(new PostingRequest(
-                    balance.getAccountId(),
-                    request.getAmount(),
-                    request.getMerchant()))
-                .retrieve(PostingResult.class);
-        })
-        
-        // Fire-and-forget: Audit and notifications
-        .fireAndForgetWith(posting -> 
-            client.post()
-                .uri("/audit/transactions")
-                .bodyValue(new AuditEntry("CARD_PAYMENT", posting.getId()))
+        // Step 2: Second API call (uses first result)
+        // If fails, we still have first result
+        SecondResult second = FluxHttpWorkflow
+            .startWith(first)
+            .step(f -> client.post()
+                .uri("/step2")
+                .bodyValue(new Step2Request(f.getId()))
+                .retrieve(SecondResult.class))
+            .stepContinueOnError(s -> client.post()
+                .uri("/step2-optional")
                 .retrieve(Void.class))
+            .execute();
+        result.setSecond(second);
         
-        .fireAndForgetWith(posting ->
-            client.post()
-                .uri("/notifications/sms")
-                .bodyValue(new SmsRequest(request.getPhone(), 
-                    "Payment of " + request.getAmount() + " processed"))
-                .retrieve(Void.class))
+        // Step 3: Third API call
+        ThirdResult third = FluxHttpWorkflow
+            .startWith(second)
+            .step(s -> client.post()
+                .uri("/step3")
+                .bodyValue(new Step3Request(s.getId()))
+                .retrieve(ThirdResult.class))
+            .execute();
+        result.setThird(third);
         
-        // On failure: Reverse any partial posting
-        .onFailure(error -> client.post()
-            .uri("/postings/reverse")
-            .bodyValue(new ReversalRequest(request.getTransactionId(), error.getMessage()))
-            .retrieve(Void.class))
-        
-        .execute(Duration.ofSeconds(30));  // With timeout
+    } catch (Exception e) {
+        result.setError(e.getMessage());
+        // Result contains whatever succeeded before failure
+    }
+    
+    return result;
 }
 ```
 
-### 8.8 Async Workflow Execution
+### 6.7 Combined: HTTP + DB + Continue on Error
 
 ```java
-// Non-blocking execution - returns Mono
-Mono<PaymentResult> resultMono = FluxHttpWorkflow.start(client)
-    .step(c -> c.post().uri("/payments").bodyValue(request).retrieve(PaymentResult.class))
+public OrderResult createOrder(CreateOrderRequest request, String correlationId) {
+    
+    return FluxHttpWorkflow
+        // Step 1: Validate with external API
+        .startWith(() -> client.post()
+            .uri("/validation/check")
+            .header("X-Correlation-Id", correlationId)
+            .bodyValue(request)
+            .retrieve(ValidationResult.class))
+        
+        // Step 2: Save to DB (blocking)
+        .stepSync(validation -> {
+            Order order = new Order();
+            order.setAccountId(validation.getAccountId());
+            order.setAmount(request.getAmount());
+            order.setStatus("PENDING");
+            return orderRepository.save(order);
+        })
+        
+        // Step 3: Process payment
+        .step(order -> client.post()
+            .uri("/payments/charge")
+            .header("X-Correlation-Id", correlationId)
+            .bodyValue(new ChargeRequest(order.getId(), order.getAmount()))
+            .retrieve(PaymentResult.class))
+        
+        // Step 4: Update order status (DB)
+        .stepSync(payment -> {
+            Order order = orderRepository.findById(payment.getOrderId()).get();
+            order.setStatus("PAID");
+            order.setPaymentId(payment.getId());
+            return orderRepository.save(order);
+        })
+        
+        // Step 5: Notify partner (non-critical - continue if fails)
+        .stepContinueOnError(
+            order -> client.post()
+                .uri("/partners/notify")
+                .bodyValue(new PartnerNotification(order.getId()))
+                .retrieve(Void.class),
+            error -> log.warn("Partner notification failed: {}", error.getMessage())
+        )
+        
+        // Background: Send email, update analytics
+        .fireAndForgetWith(order -> client.post()
+            .uri("/email/confirmation")
+            .bodyValue(new EmailRequest(request.getEmail(), order.getId()))
+            .retrieve(Void.class))
+        
+        .fireAndForgetSync(() -> 
+            analyticsRepository.trackEvent("order_created", request.getAmount()))
+        
+        // Rollback: If payment fails, mark order as failed
+        .onFailureSync(error -> {
+            log.error("Order creation failed: {}", error.getMessage());
+            // Update order status to FAILED
+        })
+        
+        .execute();
+}
+```
+
+### 6.8 Async Execution
+
+```java
+// Non-blocking - returns Mono
+Mono<Order> orderMono = FluxHttpWorkflow
+    .startWith(() -> client.post().uri("/orders").retrieve(Order.class))
     .executeAsync();
 
 // Subscribe to result
-resultMono.subscribe(
-    result -> log.info("Payment completed: {}", result.getId()),
-    error -> log.error("Payment failed: {}", error.getMessage())
+orderMono.subscribe(
+    order -> log.info("Order created: {}", order.getId()),
+    error -> log.error("Failed: {}", error.getMessage())
 );
 
 // Fire completely in background (no result tracking)
-FluxHttpWorkflow.start(client)
-    .step(c -> c.post().uri("/background/job").bodyValue(job).retrieve(Void.class))
-    .fireAndForget(
-        () -> client.post().uri("/cleanup").retrieve(Void.class)
-    )
-    .executeAndForget();  // Returns immediately, runs in background
+FluxHttpWorkflow
+    .startWith(() -> client.post().uri("/background/job").retrieve(Void.class))
+    .executeAndForget();  // Returns immediately
 ```
 
 ---
 
-## 9. Error Handling & Custom Error Messages
+## 7. Resilience
 
-### 9.1 Global Error Mappers
-
-Define custom exceptions based on HTTP status codes:
-
-```java
-FluxHttpClient client = FluxHttpClientBuilder.builder()
-    .baseUrl("https://api.example.com")
-    
-    // Map 404 to custom exception
-    .addErrorMapper(ErrorMapper.onStatus(
-        status -> status == HttpStatus.NOT_FOUND,
-        ctx -> new ResourceNotFoundException(
-            "Resource not found: " + ctx.getUri(),
-            ctx.getRequestId())))
-    
-    // Map 401/403 to auth exception
-    .addErrorMapper(ErrorMapper.onStatus(
-        status -> status == HttpStatus.UNAUTHORIZED || status == HttpStatus.FORBIDDEN,
-        ctx -> new AuthenticationException(
-            "Authentication failed for " + ctx.getUri(),
-            ctx.getStatusCode().value())))
-    
-    // Map 5xx to service exception with response body
-    .addErrorMapper(ErrorMapper.onStatus(
-        HttpStatus::is5xxServerError,
-        ctx -> new ServiceUnavailableException(
-            "Service error: " + ctx.getBody(),
-            ctx.getStatusCode().value(),
-            ctx.getRequestId())))
-    
-    // Map specific status code
-    .addErrorMapper(ErrorMapper.onStatus(
-        status -> status.value() == 429,
-        ctx -> new RateLimitException(
-            "Rate limit exceeded",
-            ctx.getHeaders().getFirst("Retry-After"))))
-    
-    .build();
-```
-
-### 9.2 Per-Request Error Mappers
-
-```java
-// Override error handling for specific request
-User user = client.get()
-    .uri("/users/{}", userId)
-    .onStatus(
-        status -> status == HttpStatus.NOT_FOUND,
-        ctx -> new UserNotFoundException("User " + userId + " not found"))
-    .onStatus(
-        status -> status == HttpStatus.FORBIDDEN,
-        ctx -> new AccessDeniedException("Cannot access user " + userId))
-    .retrieveBody(User.class)
-    .block();
-```
-
-### 9.3 Error Context
-
-```java
-.addErrorMapper(ErrorMapper.onStatus(
-    HttpStatus::is4xxClientError,
-    ctx -> {
-        // Available context
-        String requestId = ctx.getRequestId();      // Unique request ID
-        HttpStatus status = ctx.getStatusCode();    // HTTP status
-        String method = ctx.getMethod();            // GET, POST, etc.
-        String uri = ctx.getUri();                  // Request URI
-        String body = ctx.getBody();                // Response body
-        HttpHeaders headers = ctx.getHeaders();     // Response headers
-        
-        // Parse error response
-        ErrorResponse error = parseError(ctx.getBody());
-        
-        return new ApiException(
-            error.getMessage(),
-            error.getCode(),
-            requestId,
-            status.value());
-    }))
-```
-
-### 9.4 Custom Exception Classes
-
-```java
-// Base exception with request context
-public class ApiException extends RuntimeException {
-    private final String errorCode;
-    private final String requestId;
-    private final int httpStatus;
-    
-    public ApiException(String message, String errorCode, String requestId, int httpStatus) {
-        super(message);
-        this.errorCode = errorCode;
-        this.requestId = requestId;
-        this.httpStatus = httpStatus;
-    }
-    
-    // Convert to API response
-    public ErrorResponse toErrorResponse() {
-        return new ErrorResponse(
-            errorCode,
-            getMessage(),
-            requestId,
-            Instant.now()
-        );
-    }
-}
-
-// Specific exceptions
-public class ResourceNotFoundException extends ApiException {
-    public ResourceNotFoundException(String resource, String requestId) {
-        super("Resource not found: " + resource, "NOT_FOUND", requestId, 404);
-    }
-}
-
-public class InsufficientFundsException extends ApiException {
-    private final BigDecimal available;
-    
-    public InsufficientFundsException(BigDecimal available) {
-        super("Insufficient funds. Available: " + available, "INSUFFICIENT_FUNDS", null, 400);
-        this.available = available;
-    }
-}
-```
-
-### 9.5 Handling Errors in Parallel Requests
-
-```java
-// With PARTIAL_SUCCESS strategy
-FluxParallelResult<User> result = client.parallel(
-    client.get().uri("/users/1").retrieve(User.class),
-    client.get().uri("/users/999").retrieve(User.class),  // Might not exist
-    client.get().uri("/users/3").retrieve(User.class)
-)
-.partialSuccess()
-.execute()
-.block();
-
-// Process results and errors
-for (int i = 0; i < 3; i++) {
-    if (result.getErrors().containsKey(i)) {
-        Throwable error = result.getErrors().get(i);
-        log.warn("Request {} failed: {}", i, error.getMessage());
-        
-        // Custom handling per error type
-        if (error instanceof ResourceNotFoundException) {
-            // Handle not found
-        } else if (error instanceof ServiceUnavailableException) {
-            // Maybe retry later
-        }
-    } else {
-        User user = result.getResponses().get(i).getBody();
-        processUser(user);
-    }
-}
-```
-
-### 9.6 Handling Errors in Workflows
-
-```java
-// Workflow with comprehensive error handling
-try {
-    PaymentResult result = FluxHttpWorkflow.start(client)
-        .step(c -> c.post()
-            .uri("/payments")
-            .bodyValue(request)
-            .retrieve(PaymentResult.class))
-        .onFailure(error -> client.post()
-            .uri("/payments/rollback")
-            .bodyValue(new RollbackRequest(request.getId()))
-            .retrieve(Void.class))
-        .execute();
-        
-    return ApiResponse.success(result);
-    
-} catch (InsufficientFundsException e) {
-    return ApiResponse.error("INSUFFICIENT_FUNDS", 
-        "Not enough balance. Available: " + e.getAvailable());
-        
-} catch (CardInactiveException e) {
-    return ApiResponse.error("CARD_INACTIVE", 
-        "Card is not active: " + e.getCardId());
-        
-} catch (FluxHttpClientException e) {
-    log.error("Payment failed - requestId: {}, uri: {}", 
-        e.getRequestId(), e.getUri(), e);
-    return ApiResponse.error("PAYMENT_FAILED", 
-        "Payment processing failed. Reference: " + e.getRequestId());
-        
-} catch (Exception e) {
-    log.error("Unexpected error", e);
-    return ApiResponse.error("INTERNAL_ERROR", "An unexpected error occurred");
-}
-```
-
-### 9.7 Controller Exception Handler
-
-```java
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-
-    @ExceptionHandler(FluxHttpClientException.class)
-    public ResponseEntity<ErrorResponse> handleFluxException(FluxHttpClientException e) {
-        log.error("Flux client error - requestId: {}, method: {}, uri: {}", 
-            e.getRequestId(), e.getMethod(), e.getUri(), e);
-        
-        ErrorResponse response = new ErrorResponse(
-            "SERVICE_ERROR",
-            "External service call failed",
-            e.getRequestId(),
-            Instant.now()
-        );
-        
-        return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(response);
-    }
-    
-    @ExceptionHandler(CircuitBreakerOpenException.class)
-    public ResponseEntity<ErrorResponse> handleCircuitBreaker(CircuitBreakerOpenException e) {
-        ErrorResponse response = new ErrorResponse(
-            "SERVICE_UNAVAILABLE",
-            "Service temporarily unavailable. Please retry later.",
-            e.getRequestId(),
-            Instant.now()
-        );
-        
-        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-            .header("Retry-After", "30")
-            .body(response);
-    }
-    
-    @ExceptionHandler(RateLimitExceededException.class)
-    public ResponseEntity<ErrorResponse> handleRateLimit(RateLimitExceededException e) {
-        ErrorResponse response = new ErrorResponse(
-            "RATE_LIMITED",
-            "Too many requests. Please slow down.",
-            e.getRequestId(),
-            Instant.now()
-        );
-        
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-            .header("Retry-After", "60")
-            .body(response);
-    }
-}
-```
-
----
-
-## 10. Resilience Patterns
-
-### 10.1 Retry Configuration
+### Retry
 
 ```java
 ResilienceConfig.custom()
     .retry(RetryConfig.custom()
         .enabled(true)
-        .maxAttempts(3)                                    // Total attempts
-        .waitDuration(Duration.ofMillis(500))              // Initial wait
+        .maxAttempts(3)
+        .waitDuration(Duration.ofMillis(500))
         .backoffStrategy(BackoffStrategy.EXPONENTIAL_WITH_JITTER)
-        .backoffMultiplier(2.0)                            // 500ms → 1s → 2s
         .retryOnConnectionTimeout(true)
-        .retryOnReadTimeout(true)
-        .retryExceptions(IOException.class, TimeoutException.class)
-        .ignoreExceptions(BadRequestException.class))      // Don't retry 4xx
+        .retryOnReadTimeout(true))
 ```
 
-### 10.2 Circuit Breaker
+### Circuit Breaker
 
 ```java
 ResilienceConfig.custom()
     .circuitBreaker(CircuitBreakerConfig.custom()
         .enabled(true)
-        .failureRate(50)                                   // Open at 50% failures
-        .slowCallRate(80)                                  // Open at 80% slow calls
-        .slowCallDuration(Duration.ofSeconds(5))           // Define "slow"
-        .windowSize(10)                                    // Sliding window
-        .minCalls(5)                                       // Min calls before evaluating
-        .openStateWait(Duration.ofSeconds(30))             // Time in OPEN state
-        .halfOpenCalls(3)                                  // Calls in HALF_OPEN
-        .autoTransition(true))                             // Auto transition to HALF_OPEN
+        .failureRate(50)           // Open at 50% failures
+        .slowCallRate(80)          // Open at 80% slow calls
+        .slowCallDuration(Duration.ofSeconds(5))
+        .windowSize(10)
+        .openStateWait(Duration.ofSeconds(30)))
 ```
 
-### 10.3 Rate Limiter
+### Rate Limiter
 
 ```java
 ResilienceConfig.custom()
     .rateLimiter(RateLimiterConfig.custom()
         .enabled(true)
-        .limitForPeriod(100)                               // 100 calls
-        .refreshPeriod(Duration.ofSeconds(1))              // Per second
-        .timeout(Duration.ofMillis(500)))                  // Wait timeout
+        .limitForPeriod(100)       // 100 calls per second
+        .refreshPeriod(Duration.ofSeconds(1)))
 ```
 
-### 10.4 Bulkhead (Concurrency Limit)
+### Disable Per-Request
 
 ```java
-ResilienceConfig.custom()
-    .bulkhead(BulkheadConfig.custom()
-        .enabled(true)
-        .maxConcurrentCalls(25)                            // Max parallel calls
-        .maxWait(Duration.ofMillis(100)))                  // Wait for slot
-```
-
-### 10.5 Disable Resilience Per-Request
-
-```java
-// For specific requests that shouldn't be retried
 client.post()
-    .uri("/payments/charge")  // Idempotency issues
-    .bodyValue(chargeRequest)
+    .uri("/payments/charge")
     .override(o -> o
         .retryEnabled(false)
         .circuitBreakerEnabled(false))
-    .retrieve(ChargeResult.class);
+    .retrieve(Result.class);
 ```
 
 ---
 
-## 11. Logging & Masking
+## 8. Logging & Masking
 
-### 11.1 Logging Configuration
-
-```java
-LoggingConfig.custom()
-    .logAll()                              // Log requests, responses, headers
-    // OR selective:
-    .logRequest()                          // Only requests
-    .logResponse()                         // Only responses
-    .logHeaders()                          // Include headers
-    
-    .maxBodySize(10_000)                   // Truncate bodies > 10KB
-```
-
-### 11.2 Field Masking
+### JSON Format (Splunk-Friendly)
 
 ```java
 LoggingConfig.custom()
     .logAll()
-    
-    // Add fields to mask (case-insensitive, partial match)
-    .maskFields("password", "cardNumber", "cvv", "pin", "ssn", "iban")
-    
-    // Custom visible characters per field
-    .maskField("cardNumber", 4)            // Show first/last 4: "4111********1111"
-    .maskField("cvv", 0)                   // Fully masked: "********"
-    
-    // Exclude fields entirely (not logged at all)
-    .excludeFields("internalId", "debugData")
-    
-    // Customize mask appearance
-    .maskSymbol('X')                       // Use X instead of *
-    .defaultVisibleChars(4)                // Default visible chars
+    .jsonFormat()                    // Single-line JSON
+    .serviceName("order-service")
+    .maskFields("password", "cardNumber", "cvv", "token")
+    .maskField("iban", 4)            // Show first/last 4 chars
+    .maxBodySize(10_000)             // Truncate large bodies
 ```
 
-### 11.3 Log Output Example
+### JSON Log Output
+
+```json
+{"timestamp":"2024-01-15T10:30:00Z","service":"order-service","type":"request","request_id":"req_001","correlation_id":"corr_abc123","method":"POST","uri":"/orders","body":{"amount":100,"cardNumber":"4111********1111"}}
+
+{"timestamp":"2024-01-15T10:30:01Z","service":"order-service","type":"response","request_id":"req_001","correlation_id":"corr_abc123","status":200,"duration_ms":245}
+```
+
+### Pretty Format (Human-Readable)
+
+```java
+LoggingConfig.custom()
+    .logAll()
+    .prettyFormat()  // Box format
+```
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
 ║ FLUX HTTP REQUEST
 ╠══════════════════════════════════════════════════════════════════╣
-║ Request ID: req-a1b2c3d4
+║ Request ID: req_001
+║ Correlation ID: corr_abc123
 ║ Method: POST
-║ URI: https://api.example.com/payments
-║ Headers:
-║   Content-Type: application/json
-║   Authorization: Bear********oken
-║   X-Request-Id: req-a1b2c3d4
+║ URI: /orders
 ║ Body:
 {
-  "amount" : 100.00,
-  "cardNumber" : "4111********1111",
-  "cvv" : "********",
-  "accountIbanDetails" : "QA58********3456"
+  "amount": 100,
+  "cardNumber": "4111********1111"
 }
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
----
-
-## 12. SSL/TLS Configuration
-
-### 12.1 Custom Certificates
+### Log Other Tasks (DB, Email, etc.)
 
 ```java
-SslConfig.custom()
-    .enabled(true)
-    .certificatePath("/path/to/cert.pem")          // Server certificate
-    .keyPath("/path/to/key.pem")                   // Private key
-    .keyPassword("keypass")                         // Key password
-    .trustStorePath("/path/to/truststore.jks")     // Trust store
-    .trustStorePassword("trustpass")
-    .handshakeTimeout(Duration.ofSeconds(10))
-```
+LoggingService logger = client.getLoggingService();
+String correlationId = "corr_abc123";
 
-### 12.2 Disable SSL Verification (Development Only!)
+// DB operation
+logger.logDb(correlationId, "save", "orders", order, durationMs);
 
-```java
-SslConfig.custom()
-    .enabled(true)
-    .trustAll(true)  // ⚠️ NEVER use in production!
+// Email
+logger.logEmail(correlationId, "send", "john@example.com", data, durationMs);
+
+// Cache
+logger.logCache(correlationId, "set", "order:123", null, durationMs);
+
+// Queue
+logger.logQueue(correlationId, "publish", "order-events", event, durationMs);
 ```
 
 ---
 
-## 13. Client Pool for Different Timeouts
+## 9. Error Handling
 
-When you need different timeout profiles for different types of requests:
+### Global Error Mappers
 
 ```java
-// Create a pool with shared configuration
-FluxHttpClientPool pool = FluxHttpClientPool.builder()
-    .baseUrl("https://api.example.com")
-    .resilience(ResilienceConfig.custom()
-        .retry(RetryConfig.custom().maxAttempts(3)))
-    .logging(LoggingConfig.custom().logAll())
-    .addRequestFilter(Filters.bearerToken(() -> tokenService.getToken()))
+FluxHttpClientBuilder.builder()
+    .addErrorMapper(ErrorMapper.onStatus(
+        status -> status == HttpStatus.NOT_FOUND,
+        ctx -> new ResourceNotFoundException("Not found: " + ctx.getUri())))
+    
+    .addErrorMapper(ErrorMapper.onStatus(
+        status -> status == HttpStatus.UNAUTHORIZED,
+        ctx -> new AuthException("Authentication failed")))
+    
+    .addErrorMapper(ErrorMapper.onStatus(
+        HttpStatus::is5xxServerError,
+        ctx -> new ServiceException("Service error: " + ctx.getBody())))
+    
     .build();
+```
 
-// Use pre-defined profiles
-FluxHttpClient fastClient = pool.getFast();      // 2s conn, 5s read, 10s response
-FluxHttpClient defaultClient = pool.getDefault(); // 5s conn, 30s read, 60s response
-FluxHttpClient slowClient = pool.getSlow();      // 10s conn, 2min read, 5min response
-FluxHttpClient batchClient = pool.getBatch();    // 10s conn, 10min read, 30min response
+### Per-Request Error Handling
 
-// Or create custom profiles
-FluxHttpClient reportClient = pool.getOrCreate("reports", 
-    TimeoutProfile.builder()
-        .connection(Duration.ofSeconds(10))
-        .read(Duration.ofMinutes(5))
-        .response(Duration.ofMinutes(10))
-        .build());
+```java
+User user = client.get()
+    .uri("/users/{}", userId)
+    .onStatus(
+        status -> status == HttpStatus.NOT_FOUND,
+        ctx -> new UserNotFoundException("User not found: " + userId))
+    .retrieveBody(User.class)
+    .block();
+```
 
-// Usage
-User user = fastClient.get().uri("/users/1").retrieveBody(User.class).block();
-Report report = reportClient.get().uri("/reports/annual").retrieveBody(Report.class).block();
+### Try-Catch Pattern
 
-// Shutdown all clients
-pool.shutdown();
+```java
+try {
+    Order order = FluxHttpWorkflow
+        .startWith(() -> client.post().uri("/orders").retrieve(Order.class))
+        .execute();
+    return ApiResponse.success(order);
+    
+} catch (ResourceNotFoundException e) {
+    return ApiResponse.error("NOT_FOUND", e.getMessage());
+    
+} catch (FluxHttpClientException e) {
+    log.error("HTTP error - requestId: {}", e.getRequestId(), e);
+    return ApiResponse.error("SERVICE_ERROR", "Please try again");
+    
+} catch (Exception e) {
+    return ApiResponse.error("INTERNAL_ERROR", "Unexpected error");
+}
 ```
 
 ---
 
-## 14. Filters
+## 10. Filters
 
-### 14.1 Built-in Request Filters
+### Built-in Filters
 
 ```java
-// Bearer token (static)
-Filters.bearerToken("my-token")
-
-// Bearer token (dynamic - refreshed on each request)
+// Bearer token (dynamic)
 Filters.bearerToken(() -> tokenService.getAccessToken())
 
-// Basic authentication
+// Basic auth
 Filters.basicAuth("username", "password")
 
-// API key header
+// API key
 Filters.apiKey("X-API-Key", "my-api-key")
 
 // Custom headers
 Filters.headers("X-Client", "my-app", "X-Version", "1.0")
-
-// Timestamp header
-Filters.timestamp("X-Request-Time")
-
-// Audit logging
-Filters.auditLog("my-service")
 ```
 
-### 14.2 Custom Request Filter
+### Custom Filter
 
 ```java
-// Add correlation ID from MDC
 RequestFilter correlationFilter = context -> {
     String correlationId = MDC.get("correlationId");
     if (correlationId != null) {
@@ -1142,255 +898,76 @@ RequestFilter correlationFilter = context -> {
     return Mono.just(context);
 };
 
-// Conditional header
-RequestFilter conditionalFilter = context -> {
-    if (context.getUri().contains("/admin")) {
-        context.addHeader("X-Admin-Token", adminToken);
-    }
-    return Mono.just(context);
-};
-
-// Request validation
-RequestFilter validationFilter = context -> {
-    if (context.getBody() == null && context.getMethod() == HttpMethod.POST) {
-        return Mono.error(new IllegalArgumentException("POST requires body"));
-    }
-    return Mono.just(context);
-};
-
-client = FluxHttpClientBuilder.builder()
+FluxHttpClientBuilder.builder()
     .addRequestFilter(correlationFilter)
-    .addRequestFilter(conditionalFilter)
-    .addRequestFilter(validationFilter)
     .build();
 ```
 
-### 14.3 Built-in Response Filters
-
-```java
-// Response audit logging
-Filters.responseAuditLog("my-service")
-
-// Slow response warning
-Filters.slowResponseLog(5000)  // Warn if > 5 seconds
-
-// Error logging
-Filters.errorLog()
-
-// Validate success
-Filters.validateSuccess()  // Throws on non-2xx
-```
-
-### 14.4 Custom Response Filter
-
-```java
-ResponseFilter metricsFilter = context -> {
-    metrics.recordLatency(context.getUri(), context.getDurationMs());
-    metrics.recordStatus(context.getUri(), context.getStatusCode());
-    return Mono.just(context);
-};
-
-ResponseFilter headerExtractor = context -> {
-    String rateLimit = context.getHeaders().getFirst("X-RateLimit-Remaining");
-    if (rateLimit != null && Integer.parseInt(rateLimit) < 10) {
-        log.warn("Rate limit nearly exhausted: {}", rateLimit);
-    }
-    return Mono.just(context);
-};
-```
-
 ---
 
-## 15. Email Notifications
+## 11. Real-World Examples
 
-### 15.1 Configuration
-
-```java
-EmailNotifierConfig.custom()
-    .host("smtp.company.com")
-    .port(587)
-    .username("alerts@company.com")
-    .password("smtp-password")
-    .useTls(true)
-    .defaultFrom("alerts@company.com")
-    .defaultTo("ops-team@company.com")
-```
-
-### 15.2 Per-Request Notifications
-
-```java
-client.post()
-    .uri("/critical/operation")
-    .bodyValue(request)
-    .onErrorNotify(mail -> mail
-        .subject("Critical Operation Failed")
-        .to("urgent@company.com")
-        .cc("manager@company.com"))
-    .retrieve(Result.class);
-```
-
----
-
-## 16. Spring Boot Integration
-
-### 16.1 Auto-Configuration
-
-```yaml
-# application.yml
-flux:
-  rest-client:
-    default:
-      base-url: https://api.example.com
-      timeouts:
-        connection: 5s
-        read: 30s
-        response: 60s
-      resilience:
-        retry:
-          enabled: true
-          max-attempts: 3
-        circuit-breaker:
-          enabled: true
-          failure-rate: 50
-      logging:
-        enabled: true
-        log-request: true
-        log-response: true
-        mask-fields: password,token,cardNumber
-```
-
-### 16.2 Bean Configuration
-
-```java
-@Configuration
-public class FluxClientConfig {
-
-    @Bean
-    @PreDestroy
-    public FluxHttpClient paymentClient(
-            JavaMailSender mailSender,
-            TokenService tokenService) {
-        return FluxHttpClientBuilder.builder("payment-client")
-            .baseUrl("https://api.payment.com")
-            .withSpringMailSender(mailSender)
-            .addRequestFilter(Filters.bearerToken(tokenService::getToken))
-            .build();
-    }
-    
-    @Bean(destroyMethod = "shutdown")
-    public FluxHttpClientPool clientPool() {
-        return FluxHttpClientPool.builder()
-            .baseUrl("https://api.example.com")
-            .build();
-    }
-}
-```
-
-### 16.3 Lifecycle Management
-
-```java
-@Component
-public class FluxClientManager implements DisposableBean {
-    
-    private final FluxHttpClient client;
-    
-    public FluxClientManager() {
-        this.client = FluxHttpClientBuilder.builder().build();
-    }
-    
-    @Override
-    public void destroy() {
-        client.shutdown();  // Clean shutdown on app stop
-    }
-}
-
-// Or with @PreDestroy
-@Component
-public class MyService {
-    private final FluxHttpClient client;
-    
-    @PreDestroy
-    public void cleanup() {
-        client.shutdown();
-    }
-}
-```
-
----
-
-## 17. Real-World Use Cases
-
-### 17.1 Payment Processing Service
+### Payment Service
 
 ```java
 @Service
-@RequiredArgsConstructor
 public class PaymentService {
     
-    private final FluxHttpClient fluxClient;
-    private final PaymentRepository paymentRepository;
+    private final FluxHttpClient client;
+    private final PaymentRepository repository;
     
-    public PaymentResponse processPayment(PaymentRequest request) {
-        try {
-            // Complex workflow with multiple steps
-            PostingResult result = FluxHttpWorkflow.start(fluxClient)
-                // Step 1: Fraud check
-                .step(c -> c.post()
-                    .uri("/fraud/check")
-                    .bodyValue(new FraudCheckRequest(request))
-                    .retrieve(FraudCheckResult.class))
-                
-                // Step 2: Validate with bank
-                .step((c, fraudResult) -> {
-                    if (fraudResult.getRiskScore() > 80) {
-                        throw new FraudDetectedException(fraudResult.getReason());
-                    }
-                    return c.post()
-                        .uri("/bank/validate")
-                        .bodyValue(request)
-                        .retrieve(BankValidation.class);
-                })
-                
-                // Step 3: Execute payment
-                .step((c, validation) -> c.post()
-                    .uri("/payments/execute")
-                    .bodyValue(new ExecuteRequest(validation.getToken(), request.getAmount()))
-                    .retrieve(PostingResult.class))
-                
-                // Background: Audit & notifications
-                .fireAndForgetWith(posting -> fluxClient.post()
-                    .uri("/audit/log")
-                    .bodyValue(new AuditEntry("PAYMENT", posting.getId()))
-                    .retrieve(Void.class))
-                
-                .fireAndForgetSync(() -> 
-                    paymentRepository.save(Payment.fromRequest(request)))
-                
-                // Rollback on failure
-                .onFailure(error -> fluxClient.post()
-                    .uri("/payments/rollback")
-                    .bodyValue(new RollbackRequest(request.getTransactionId()))
-                    .retrieve(Void.class))
-                
-                .execute(Duration.ofSeconds(30));
+    public PaymentResult processPayment(PaymentRequest request) {
+        String correlationId = UUID.randomUUID().toString();
+        
+        return FluxHttpWorkflow
+            // 1. Fraud check
+            .startWith(() -> client.post()
+                .uri("/fraud/check")
+                .header("X-Correlation-Id", correlationId)
+                .bodyValue(request)
+                .retrieve(FraudResult.class))
             
-            return PaymentResponse.success(result);
+            // 2. Validate
+            .step(fraud -> {
+                if (fraud.getRiskScore() > 80) {
+                    throw new FraudException("High risk transaction");
+                }
+                return client.post()
+                    .uri("/validation")
+                    .bodyValue(request)
+                    .retrieve(ValidationResult.class);
+            })
             
-        } catch (FraudDetectedException e) {
-            return PaymentResponse.declined("FRAUD_DETECTED", e.getMessage());
-        } catch (InsufficientFundsException e) {
-            return PaymentResponse.declined("INSUFFICIENT_FUNDS", 
-                "Available: " + e.getAvailable());
-        } catch (Exception e) {
-            log.error("Payment failed", e);
-            return PaymentResponse.error("PROCESSING_ERROR", 
-                "Please try again later");
-        }
+            // 3. Charge
+            .step(validation -> client.post()
+                .uri("/charge")
+                .bodyValue(new ChargeRequest(validation.getToken(), request.getAmount()))
+                .retrieve(PaymentResult.class))
+            
+            // 4. Save to DB
+            .stepSync(payment -> {
+                repository.save(Payment.from(payment));
+                return payment;
+            })
+            
+            // Background tasks
+            .fireAndForgetWith(payment -> client.post()
+                .uri("/notifications/email")
+                .bodyValue(new EmailRequest(request.getEmail(), payment.getId()))
+                .retrieve(Void.class))
+            
+            // Rollback on failure
+            .onFailure(() -> client.post()
+                .uri("/payments/rollback")
+                .bodyValue(new RollbackRequest(request.getTransactionId()))
+                .retrieve(Void.class))
+            
+            .execute(Duration.ofSeconds(30));
     }
 }
 ```
 
-### 17.2 Dashboard Aggregation
+### Dashboard Aggregation (Parallel)
 
 ```java
 @Service
@@ -1399,165 +976,41 @@ public class DashboardService {
     private final FluxHttpClient client;
     
     public DashboardData getDashboard(String userId) {
-        // Fetch all data in parallel
         FluxParallelResult<Object> result = client.parallel(
             client.get().uri("/users/{}", userId).retrieve(User.class),
-            client.get().uri("/users/{}/orders/recent", userId).retrieve(OrderList.class),
-            client.get().uri("/users/{}/notifications", userId).retrieve(NotificationList.class),
-            client.get().uri("/users/{}/recommendations", userId).retrieve(RecommendationList.class),
-            client.get().uri("/promotions/active").retrieve(PromotionList.class)
+            client.get().uri("/orders/recent?userId={}", userId).retrieve(OrderList.class),
+            client.get().uri("/notifications?userId={}", userId).retrieve(NotificationList.class),
+            client.get().uri("/recommendations?userId={}", userId).retrieve(RecommendationList.class)
         )
-        .partialSuccess()  // Don't fail if recommendations are down
+        .partialSuccess()  // Don't fail if recommendations is down
         .execute()
         .block();
         
-        // Build dashboard with available data
         DashboardData dashboard = new DashboardData();
-        dashboard.setUser((User) getOrNull(result, 0));
-        dashboard.setRecentOrders((OrderList) getOrNull(result, 1));
-        dashboard.setNotifications((NotificationList) getOrNull(result, 2));
-        dashboard.setRecommendations((RecommendationList) getOrNull(result, 3));
-        dashboard.setPromotions((PromotionList) getOrNull(result, 4));
-        
-        // Log any failures
-        result.getErrors().forEach((idx, error) -> 
-            log.warn("Dashboard component {} failed: {}", idx, error.getMessage()));
+        dashboard.setUser((User) getResult(result, 0));
+        dashboard.setOrders((OrderList) getResult(result, 1));
+        dashboard.setNotifications((NotificationList) getResult(result, 2));
+        dashboard.setRecommendations((RecommendationList) getResult(result, 3));
         
         return dashboard;
     }
     
-    private Object getOrNull(FluxParallelResult<?> result, int index) {
-        if (result.getErrors().containsKey(index)) {
-            return null;
-        }
-        return result.getResponses().get(index).getBody();
-    }
-}
-```
-
-### 17.3 Batch Processing with Rate Limiting
-
-```java
-@Service
-public class BatchProcessor {
-    
-    private final FluxHttpClient client;
-    
-    public BatchResult processBatch(List<Item> items) {
-        List<ProcessingResult> results = new ArrayList<>();
-        List<String> failures = new ArrayList<>();
-        
-        // Process in chunks to respect rate limits
-        List<List<Item>> chunks = Lists.partition(items, 10);
-        
-        for (List<Item> chunk : chunks) {
-            // Process chunk in parallel
-            List<Mono<FluxResponse<ProcessingResult>>> requests = chunk.stream()
-                .map(item -> client.post()
-                    .uri("/process")
-                    .bodyValue(item)
-                    .retrieve(ProcessingResult.class))
-                .collect(Collectors.toList());
-            
-            FluxParallelResult<ProcessingResult> chunkResult = client
-                .parallel(requests.toArray(new Mono[0]))
-                .partialSuccess()
-                .execute()
-                .block();
-            
-            // Collect results
-            for (int i = 0; i < chunk.size(); i++) {
-                if (chunkResult.getErrors().containsKey(i)) {
-                    failures.add(chunk.get(i).getId() + ": " + 
-                        chunkResult.getErrors().get(i).getMessage());
-                } else {
-                    results.add(chunkResult.getResponses().get(i).getBody());
-                }
-            }
-            
-            // Rate limit between chunks
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        
-        return new BatchResult(results, failures);
-    }
-}
-```
-
-### 17.4 Event-Driven with Fire-and-Forget
-
-```java
-@Service
-public class OrderService {
-    
-    private final FluxHttpClient client;
-    private final OrderRepository orderRepository;
-    
-    @Transactional
-    public Order createOrder(CreateOrderRequest request) {
-        // Main operation: Create order
-        Order order = FluxHttpWorkflow.start(client)
-            .step(c -> c.post()
-                .uri("/orders")
-                .bodyValue(request)
-                .retrieve(Order.class))
-            
-            // Fire-and-forget: Trigger all downstream systems
-            // These don't block the response
-            .fireAndForgetWith(o -> client.post()
-                .uri("/inventory/reserve")
-                .bodyValue(new ReserveRequest(o.getItems()))
-                .retrieve(Void.class))
-            
-            .fireAndForgetWith(o -> client.post()
-                .uri("/shipping/schedule")
-                .bodyValue(new ShippingRequest(o.getId(), o.getAddress()))
-                .retrieve(Void.class))
-            
-            .fireAndForgetWith(o -> client.post()
-                .uri("/email/send")
-                .bodyValue(new EmailRequest(o.getCustomerEmail(), "Order Confirmed", 
-                    "Your order " + o.getId() + " has been placed"))
-                .retrieve(Void.class))
-            
-            .fireAndForgetWith(o -> client.post()
-                .uri("/analytics/track")
-                .bodyValue(new AnalyticsEvent("order_created", o.getId()))
-                .retrieve(Void.class))
-            
-            // Background DB save
-            .fireAndForgetSync(() -> 
-                orderRepository.save(OrderEntity.fromOrder(order)))
-            
-            // Custom error handler for fire-and-forget failures
-            .onFireAndForgetError(error -> 
-                log.warn("Background task failed: {}", error.getMessage()))
-            
-            .execute();
-        
-        return order;  // Returns immediately after order created
+    private Object getResult(FluxParallelResult<?> result, int index) {
+        return result.getErrors().containsKey(index) 
+            ? null 
+            : result.getResponses().get(index).getBody();
     }
 }
 ```
 
 ---
 
-## Summary
+## 💡 Tips
 
-The FLUX REST Client provides a comprehensive solution for HTTP communication in Java applications with:
-
-- **Fluent API** for readable, chainable requests
-- **Multiple execution patterns**: standalone, parallel, sequential, workflow
-- **Production-ready resilience**: retry, circuit breaker, rate limiter, bulkhead
-- **Comprehensive logging** with sensitive data masking
-- **Flexible error handling** with custom exception mapping
-- **Fire-and-forget** for non-blocking background tasks
-- **Database integration** for both reactive and blocking operations
-- **Spring Boot integration** with auto-configuration
-
-For questions or issues, contact the platform team.
+1. **Always call `shutdown()`** when your application stops
+2. **Use `correlationId`** to trace requests across services
+3. **Use `stepContinueOnError()`** for non-critical steps
+4. **Use `fireAndForget*()`** for background tasks that shouldn't block response
+5. **Use `partialSuccess()`** for parallel calls where some can fail
+6. **Mask sensitive fields** in logs (passwords, tokens, card numbers)
+7. **Set appropriate timeouts** per endpoint type
