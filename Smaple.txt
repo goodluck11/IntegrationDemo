@@ -1,0 +1,967 @@
+package com.cbq.restclient.config;
+
+import java.util.*;
+
+/**
+ * Logging configuration with production safeguards.
+ * 
+ * <p>Log Formats:</p>
+ * <ul>
+ *   <li><b>PRETTY</b> - Human-readable box format (default)</li>
+ *   <li><b>JSON</b> - Single-line JSON, Splunk-friendly (like Stripe)</li>
+ * </ul>
+ * 
+ * <p>Safety features:</p>
+ * <ul>
+ *   <li><b>Max body size</b> - Truncates large bodies (default 10KB)</li>
+ *   <li><b>Content-Type filtering</b> - Never logs binary content</li>
+ *   <li><b>Async logging</b> - Never blocks Netty threads</li>
+ *   <li><b>Field masking</b> - Protects sensitive data</li>
+ * </ul>
+ */
+public class LoggingConfig {
+
+    public enum LogFormat {
+        PRETTY,  // Human-readable box format
+        JSON     // Single-line JSON (Stripe-style, Splunk-friendly)
+    }
+
+    private boolean enabled = false;
+    private boolean logHeaders = false;
+    private boolean logRequest = false;
+    private boolean logResponse = false;
+    private LogFormat format = LogFormat.PRETTY;
+    private String serviceName = "cbq-client";
+    
+    // Safety: Max body size to log (default 10KB)
+    private int maxBodySize = 10_000;
+    
+    // Field masking - stored as lowercase for efficient lookup
+    private Set<String> fieldsToMask = new HashSet<>(Arrays.asList(
+            "password", "passwd", "pwd", "secret", "token", "apikey", "api_key",
+            "authorization", "bearer", "credential", "credit_card", "creditcard",
+            "cvv", "cvc", "ssn", "social_security", "pin", "iban", "accountiban"
+    ));
+    private Set<String> fieldsToExclude = new HashSet<>();
+    private Map<String, Integer> fieldMaskLengths = new HashMap<>();
+    private char maskSymbol = '*';
+    private int defaultVisibleChars = 4;
+
+    // Content types to never log (binary)
+    private static final Set<String> NEVER_LOG_CONTENT_TYPES = Set.of(
+            "multipart/form-data",
+            "application/octet-stream",
+            "application/pdf",
+            "application/zip",
+            "application/gzip",
+            "application/x-tar"
+    );
+    
+    private static final Set<String> NEVER_LOG_CONTENT_TYPE_PREFIXES = Set.of(
+            "image/", "video/", "audio/", "application/x-binary"
+    );
+
+    private LoggingConfig() {}
+
+    public static LoggingConfig disabled() {
+        return new LoggingConfig();
+    }
+
+    public static LoggingConfig custom() {
+        return new LoggingConfig().enabled(true);
+    }
+
+    public LoggingConfig enabled(boolean enabled) {
+        this.enabled = enabled;
+        return this;
+    }
+
+    public LoggingConfig logHeaders() {
+        this.logHeaders = true;
+        this.enabled = true;
+        return this;
+    }
+
+    public LoggingConfig logRequest() {
+        this.logRequest = true;
+        this.enabled = true;
+        return this;
+    }
+
+    public LoggingConfig logResponse() {
+        this.logResponse = true;
+        this.enabled = true;
+        return this;
+    }
+
+    public LoggingConfig logAll() {
+        this.logHeaders = true;
+        this.logRequest = true;
+        this.logResponse = true;
+        this.enabled = true;
+        return this;
+    }
+
+    /**
+     * Use JSON format (Stripe-style, Splunk-friendly)
+     * Single-line JSON logs that can be easily searched by correlation_id
+     */
+    public LoggingConfig jsonFormat() {
+        this.format = LogFormat.JSON;
+        return this;
+    }
+
+    /**
+     * Use pretty format (human-readable boxes)
+     */
+    public LoggingConfig prettyFormat() {
+        this.format = LogFormat.PRETTY;
+        return this;
+    }
+
+    /**
+     * Set service name for JSON logs
+     */
+    public LoggingConfig serviceName(String serviceName) {
+        this.serviceName = serviceName;
+        return this;
+    }
+
+    public LoggingConfig maxBodySize(int maxBytes) {
+        this.maxBodySize = maxBytes;
+        return this;
+    }
+
+    public LoggingConfig maskFields(String... fields) {
+        for (String field : fields) {
+            this.fieldsToMask.add(field.toLowerCase());
+        }
+        return this;
+    }
+
+    public LoggingConfig maskField(String field, int visibleChars) {
+        this.fieldsToMask.add(field.toLowerCase());
+        this.fieldMaskLengths.put(field.toLowerCase(), visibleChars);
+        return this;
+    }
+
+    public LoggingConfig excludeFields(String... fields) {
+        for (String field : fields) {
+            this.fieldsToExclude.add(field.toLowerCase());
+        }
+        return this;
+    }
+
+    public LoggingConfig maskSymbol(char symbol) {
+        this.maskSymbol = symbol;
+        return this;
+    }
+
+    public LoggingConfig defaultVisibleChars(int chars) {
+        this.defaultVisibleChars = chars;
+        return this;
+    }
+
+    // Getters
+    public boolean isEnabled() { return enabled; }
+    public boolean isLogHeaders() { return logHeaders; }
+    public boolean isLogRequest() { return logRequest; }
+    public boolean isLogResponse() { return logResponse; }
+    public LogFormat getFormat() { return format; }
+    public String getServiceName() { return serviceName; }
+    public int getMaxBodySize() { return maxBodySize; }
+    public Set<String> getFieldsToMask() { return fieldsToMask; }
+    public Set<String> getFieldsToExclude() { return fieldsToExclude; }
+    public Map<String, Integer> getFieldMaskLengths() { return fieldMaskLengths; }
+    public char getMaskSymbol() { return maskSymbol; }
+    public int getDefaultVisibleChars() { return defaultVisibleChars; }
+
+    /**
+     * Checks if a content type should be logged
+     */
+    public static boolean shouldLogContentType(String contentType) {
+        if (contentType == null) return true;
+        
+        String ct = contentType.toLowerCase();
+        
+        // Check exact matches
+        for (String blocked : NEVER_LOG_CONTENT_TYPES) {
+            if (ct.startsWith(blocked)) return false;
+        }
+        
+        // Check prefixes
+        for (String prefix : NEVER_LOG_CONTENT_TYPE_PREFIXES) {
+            if (ct.startsWith(prefix)) return false;
+        }
+        
+        return true;
+    }
+}
+
+
+LogSERVICE ==================
+
+
+package com.cbq.restclient.logging;
+
+import com.cbq.restclient.config.LoggingConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Production-safe logging service with:
+ * - JSON format (Stripe-style, Splunk-friendly)
+ * - Pretty format (human-readable)
+ * - Correlation ID tracking across all calls
+ * - Max body size limits
+ * - Async logging (never blocks Netty)
+ * - Field masking for sensitive data
+ */
+public class LoggingService {
+    private static final Logger log = LoggerFactory.getLogger(LoggingService.class);
+    
+    private final LoggingConfig config;
+    private final ObjectMapper objectMapper;
+    private final Scheduler loggingScheduler;
+    
+    // Pre-computed lowercase sets for efficient lookup
+    private final Set<String> fieldsToMaskLower;
+    private final Set<String> fieldsToExcludeLower;
+    
+    // Pattern for masking in non-JSON content
+    private final Map<String, Pattern> maskPatterns = new HashMap<>();
+
+    public LoggingService(LoggingConfig config) {
+        this.config = config;
+        this.objectMapper = new ObjectMapper();
+        this.loggingScheduler = Schedulers.newBoundedElastic(2, 100, "cbq-logging");
+        
+        // Pre-compute lowercase sets at startup
+        this.fieldsToMaskLower = new HashSet<>();
+        for (String field : config.getFieldsToMask()) {
+            this.fieldsToMaskLower.add(field.toLowerCase());
+        }
+        
+        this.fieldsToExcludeLower = new HashSet<>();
+        for (String field : config.getFieldsToExclude()) {
+            this.fieldsToExcludeLower.add(field.toLowerCase());
+        }
+        
+        // Build mask patterns
+        for (String field : fieldsToMaskLower) {
+            String pattern = String.format("(?i)(\"%s\"\\s*:\\s*\")[^\"]*(\"|$)", field);
+            maskPatterns.put(field, Pattern.compile(pattern));
+        }
+    }
+
+    /**
+     * Logs request asynchronously
+     */
+    public Mono<Void> logRequestAsync(String requestId, String correlationId, String method, 
+                                       String uri, HttpHeaders headers, Object body, 
+                                       String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogRequest()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> logRequest(requestId, correlationId, method, uri, 
+                headers, body, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logRequestAsync(String requestId, String method, String uri,
+                                       HttpHeaders headers, Object body, String contentType) {
+        return logRequestAsync(requestId, null, method, uri, headers, body, contentType, "http");
+    }
+
+    /**
+     * Logs response asynchronously
+     */
+    public Mono<Void> logResponseAsync(String requestId, String correlationId, int status, 
+                                        HttpHeaders headers, String body, long durationMs, 
+                                        String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogResponse()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> logResponse(requestId, correlationId, status, headers, 
+                body, durationMs, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logResponseAsync(String requestId, int status, HttpHeaders headers,
+                                        String body, long durationMs, String contentType) {
+        return logResponseAsync(requestId, null, status, headers, body, durationMs, contentType, "http");
+    }
+
+    private void logRequest(String requestId, String correlationId, String method, String uri,
+                           HttpHeaders headers, Object body, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logRequestJson(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        } else {
+            logRequestPretty(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        }
+    }
+
+    private void logResponse(String requestId, String correlationId, int status, HttpHeaders headers,
+                            String body, long durationMs, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logResponseJson(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        } else {
+            logResponsePretty(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // JSON FORMAT (Stripe-style, Splunk-friendly)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestJson(String requestId, String correlationId, String method, String uri,
+                                HttpHeaders headers, Object body, String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", "request");
+            logNode.put("task_type", taskType);
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("method", method);
+            logNode.put("uri", uri);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        String value = maskHeaderValue(name, String.join(", ", values));
+                        headersNode.put(name, value);
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String bodyStr = formatBodyCompact(body);
+                String maskedBody = maskBodyCompact(bodyStr);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logResponseJson(String requestId, String correlationId, int status, 
+                                 HttpHeaders headers, String body, long durationMs, 
+                                 String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("service", config.getServiceName());
+            logNode.put("type", "response");
+            logNode.put("task_type", taskType);
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            logNode.put("status", status);
+            logNode.put("duration_ms", durationMs);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        headersNode.put(name, String.join(", ", values));
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String maskedBody = maskBodyCompact(body);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRETTY FORMAT (Human-readable)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestPretty(String requestId, String correlationId, String method, String uri,
+                                  HttpHeaders headers, Object body, String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP REQUEST [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Method: ").append(method).append("\n");
+        sb.append("║ URI: ").append(uri).append("\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    value = maskHeaderValue(name, value);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String bodyStr = formatBody(body, contentType);
+            sb.append("║ Body:\n").append(bodyStr).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    private void logResponsePretty(String requestId, String correlationId, int status, 
+                                   HttpHeaders headers, String body, long durationMs, 
+                                   String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP RESPONSE [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Status: ").append(status).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String maskedBody = maskBody(body);
+            String truncatedBody = truncateBody(maskedBody);
+            sb.append("║ Body:\n").append(truncatedBody).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private boolean shouldLogBody(String contentType) {
+        return LoggingConfig.shouldLogContentType(contentType);
+    }
+
+    private String formatBody(Object body, String contentType) {
+        if (body == null) return "";
+        
+        String bodyStr;
+        if (body instanceof String) {
+            bodyStr = (String) body;
+        } else {
+            try {
+                bodyStr = objectMapper.writeValueAsString(body);
+            } catch (JsonProcessingException e) {
+                bodyStr = body.toString();
+            }
+        }
+        
+        return truncateBody(maskBody(bodyStr));
+    }
+    
+    private String formatBodyCompact(Object body) {
+        if (body == null) return "";
+        
+        if (body instanceof String) {
+            return (String) body;
+        }
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            return body.toString();
+        }
+    }
+
+    private String maskBody(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String maskBodyCompact(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writeValueAsString(node);  // Compact, no pretty print
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String applyPatternMasking(String body) {
+        String masked = body;
+        for (Map.Entry<String, Pattern> entry : maskPatterns.entrySet()) {
+            Matcher matcher = entry.getValue().matcher(masked);
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    entry.getKey().toLowerCase(), config.getDefaultVisibleChars());
+            masked = matcher.replaceAll("$1" + generateMask(visibleChars) + "$2");
+        }
+        return masked;
+    }
+
+    private void maskJsonNode(JsonNode node) {
+        if (node == null) return;
+        
+        if (node.isObject()) {
+            ObjectNode objNode = (ObjectNode) node;
+            Iterator<String> fieldNames = objNode.fieldNames();
+            List<String> names = new ArrayList<>();
+            fieldNames.forEachRemaining(names::add);
+            
+            for (String fieldName : names) {
+                String fieldNameLower = fieldName.toLowerCase();
+                
+                if (fieldsToExcludeLower.contains(fieldNameLower)) {
+                    objNode.remove(fieldName);
+                    continue;
+                }
+                
+                boolean shouldMask = fieldsToMaskLower.contains(fieldNameLower) ||
+                        shouldMaskPartial(fieldNameLower);
+                
+                if (shouldMask) {
+                    int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                            fieldNameLower, config.getDefaultVisibleChars());
+                    JsonNode valueNode = objNode.get(fieldName);
+                    if (valueNode != null && valueNode.isTextual()) {
+                        String value = valueNode.asText();
+                        objNode.put(fieldName, maskValue(value, visibleChars));
+                    } else if (valueNode != null && !valueNode.isNull()) {
+                        objNode.put(fieldName, generateMask(0));
+                    }
+                } else {
+                    maskJsonNode(objNode.get(fieldName));
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode element : node) {
+                maskJsonNode(element);
+            }
+        }
+    }
+    
+    private boolean shouldMaskPartial(String fieldNameLower) {
+        for (String maskField : fieldsToMaskLower) {
+            if (fieldNameLower.contains(maskField) || maskField.contains(fieldNameLower)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String maskValue(String value, int visibleChars) {
+        if (value == null || value.length() <= visibleChars * 2) {
+            return generateMask(0);
+        }
+        
+        String mask = String.valueOf(config.getMaskSymbol()).repeat(
+                Math.min(8, value.length() - visibleChars * 2));
+        
+        if (visibleChars > 0) {
+            return value.substring(0, visibleChars) + mask + 
+                   value.substring(value.length() - visibleChars);
+        }
+        return mask;
+    }
+
+    private String generateMask(int visibleChars) {
+        return String.valueOf(config.getMaskSymbol()).repeat(8);
+    }
+
+    private String maskHeaderValue(String headerName, String value) {
+        String lowerName = headerName.toLowerCase();
+        if (fieldsToMaskLower.contains(lowerName) || 
+            lowerName.contains("authorization") || 
+            lowerName.contains("token") ||
+            lowerName.contains("api-key") ||
+            lowerName.contains("apikey")) {
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    lowerName, config.getDefaultVisibleChars());
+            return maskValue(value, visibleChars);
+        }
+        return value;
+    }
+
+    private String truncateBody(String body) {
+        if (body == null) return "";
+        
+        int maxSize = config.getMaxBodySize();
+        if (body.length() <= maxSize) {
+            return body;
+        }
+        
+        return body.substring(0, maxSize) + "...[TRUNCATED]";
+    }
+
+    public void logError(String requestId, String correlationId, String method, String uri, 
+                        Throwable error, long durationMs) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            try {
+                ObjectNode logNode = objectMapper.createObjectNode();
+                logNode.put("timestamp", Instant.now().toString());
+                logNode.put("service", config.getServiceName());
+                logNode.put("type", "error");
+                logNode.put("request_id", requestId);
+                if (correlationId != null) {
+                    logNode.put("correlation_id", correlationId);
+                }
+                logNode.put("method", method);
+                logNode.put("uri", uri);
+                logNode.put("duration_ms", durationMs);
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+                
+                log.error(objectMapper.writeValueAsString(logNode));
+            } catch (Exception e) {
+                log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+            }
+        } else {
+            log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+        }
+    }
+    
+    // Backward compatible
+    public void logError(String requestId, String method, String uri, Throwable error, long durationMs) {
+        logError(requestId, null, method, uri, error, durationMs);
+    }
+
+    public void shutdown() {
+        loggingScheduler.dispose();
+    }
+}
+
+
+package com.cbq.restclient.logging;
+
+import com.cbq.restclient.config.LoggingConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+public final class LoggingService {
+
+    private static final Logger log = LoggerFactory.getLogger(LoggingService.class);
+
+    private final LoggingConfig config;
+    private final ObjectMapper mapper;
+    private final Scheduler scheduler;
+
+    private final Set<String> maskFields;
+    private final Set<String> excludeFields;
+    private final Map<String, Integer> maskLengths;
+
+    public LoggingService(LoggingConfig config) {
+        this.config = config;
+        this.mapper = new ObjectMapper();
+        this.scheduler = Schedulers.newBoundedElastic(2, 100, "cbq-logging");
+
+        this.maskFields = normalizeSet(config.getFieldsToMask());
+        this.excludeFields = normalizeSet(config.getFieldsToExclude());
+
+        this.maskLengths = config.getFieldMaskLengths().entrySet().stream()
+                .collect(Collectors.toUnmodifiableMap(
+                        e -> normalize(e.getKey()),
+                        Map.Entry::getValue
+                ));
+    }
+
+    /* ========================== PUBLIC API ========================== */
+
+    public Mono<Void> logRequestAsync(
+            String requestId,
+            String method,
+            String uri,
+            HttpHeaders headers,
+            Object body,
+            String contentType
+    ) {
+        if (!config.isEnabled() || !config.isLogRequest()) return Mono.empty();
+
+        return Mono.fromRunnable(() ->
+                logRequest(requestId, method, uri, headers, body, contentType)
+        ).subscribeOn(scheduler).then();
+    }
+
+    public Mono<Void> logResponseAsync(
+            String requestId,
+            int status,
+            HttpHeaders headers,
+            String body,
+            long durationMs,
+            String contentType
+    ) {
+        if (!config.isEnabled() || !config.isLogResponse()) return Mono.empty();
+
+        return Mono.fromRunnable(() ->
+                logResponse(requestId, status, headers, body, durationMs, contentType)
+        ).subscribeOn(scheduler).then();
+    }
+
+    /* ========================== REQUEST ========================== */
+
+    private void logRequest(
+            String requestId,
+            String method,
+            String uri,
+            HttpHeaders headers,
+            Object body,
+            String contentType
+    ) {
+        StringBuilder sb = new StringBuilder();
+
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n")
+          .append("║ CBQ HTTP REQUEST\n")
+          .append("╠══════════════════════════════════════════════════════════════════╣\n")
+          .append("║ Request ID: ").append(maskMetadata("requestId", requestId)).append('\n')
+          .append("║ Method: ").append(method).append('\n')
+          .append("║ URI: ").append(uri).append('\n');
+
+        logHeaders(sb, headers);
+
+        if (body != null && LoggingConfig.shouldLogContentType(contentType)) {
+            sb.append("║ Body:\n")
+              .append(truncate(maskBody(body)))
+              .append('\n');
+        }
+
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        log.info(sb.toString());
+    }
+
+    /* ========================== RESPONSE ========================== */
+
+    private void logResponse(
+            String requestId,
+            int status,
+            HttpHeaders headers,
+            String body,
+            long durationMs,
+            String contentType
+    ) {
+        StringBuilder sb = new StringBuilder();
+
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n")
+          .append("║ CBQ HTTP RESPONSE\n")
+          .append("╠══════════════════════════════════════════════════════════════════╣\n")
+          .append("║ Request ID: ").append(maskMetadata("requestId", requestId)).append('\n')
+          .append("║ Status: ").append(status).append('\n')
+          .append("║ Duration: ").append(durationMs).append("ms\n");
+
+        logHeaders(sb, headers);
+
+        if (body != null && LoggingConfig.shouldLogContentType(contentType)) {
+            sb.append("║ Body:\n")
+              .append(truncate(maskBody(body)))
+              .append('\n');
+        }
+
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        log.info(sb.toString());
+    }
+
+    /* ========================== MASKING ========================== */
+
+    private String maskBody(Object body) {
+        try {
+            JsonNode node = body instanceof String
+                    ? mapper.readTree((String) body)
+                    : mapper.valueToTree(body);
+
+            maskJson(node);
+            return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+
+        } catch (Exception e) {
+            return body.toString();
+        }
+    }
+
+    private void maskJson(JsonNode node) {
+        if (node == null) return;
+
+        if (node.isObject()) {
+            ObjectNode obj = (ObjectNode) node;
+            Iterator<String> names = obj.fieldNames();
+
+            List<String> fields = new ArrayList<>();
+            names.forEachRemaining(fields::add);
+
+            for (String field : fields) {
+                String norm = normalize(field);
+
+                if (excludeFields.contains(norm)) {
+                    obj.remove(field);
+                    continue;
+                }
+
+                JsonNode value = obj.get(field);
+
+                if (maskFields.contains(norm)) {
+                    int visible = maskLengths.getOrDefault(
+                            norm,
+                            config.getDefaultVisibleChars()
+                    );
+                    obj.put(field, maskValue(value, visible));
+                } else {
+                    maskJson(value);
+                }
+            }
+        }
+
+        if (node.isArray()) {
+            for (JsonNode e : node) maskJson(e);
+        }
+    }
+
+    private String maskValue(JsonNode node, int visibleChars) {
+        if (node == null || node.isNull()) return mask();
+
+        String value = node.isTextual() ? node.asText() : node.toString();
+        if (value.length() <= visibleChars * 2) return mask();
+
+        return value.substring(0, visibleChars)
+                + mask()
+                + value.substring(value.length() - visibleChars);
+    }
+
+    private String mask() {
+        return String.valueOf(config.getMaskSymbol()).repeat(8);
+    }
+
+    private String maskMetadata(String name, String value) {
+        if (value == null) return null;
+        return maskFields.contains(normalize(name))
+                ? maskValue(TextNode.valueOf(value), config.getDefaultVisibleChars())
+                : value;
+    }
+
+    /* ========================== HELPERS ========================== */
+
+    private void logHeaders(StringBuilder sb, HttpHeaders headers) {
+        if (!config.isLogHeaders() || headers == null) return;
+
+        sb.append("║ Headers:\n");
+        headers.forEach((k, v) -> {
+            if (!excludeFields.contains(normalize(k))) {
+                sb.append("║   ").append(k).append(": ")
+                  .append(String.join(",", v))
+                  .append('\n');
+            }
+        });
+    }
+
+    private String truncate(String body) {
+        if (body == null) return "";
+        int max = config.getMaxBodySize();
+        return body.length() <= max
+                ? body
+                : body.substring(0, max) + "\n... [TRUNCATED]";
+    }
+
+    private static Set<String> normalizeSet(Collection<String> raw) {
+        return raw.stream()
+                .map(LoggingService::normalize)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    private static String normalize(String value) {
+        return value == null
+                ? ""
+                : value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+    }
+
+    public void shutdown() {
+        scheduler.dispose();
+    }
+}
+
+
+
+
