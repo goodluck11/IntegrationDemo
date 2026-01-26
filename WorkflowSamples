@@ -1,0 +1,508 @@
+package com.cbq.restclient.examples;
+
+import com.cbq.restclient.config.*;
+import com.cbq.restclient.core.CBQRestClient;
+import com.cbq.restclient.core.CBQRestClientBuilder;
+import com.cbq.restclient.core.CBQWorkflow;
+import com.cbq.restclient.model.CBQResponse;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Duration;
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * WORKFLOW EXAMPLES - Sequential, Parallel, Fire-and-Forget, DB Integration
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+@Slf4j
+public class WorkflowExamples {
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MODELS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class Status { String status; boolean active; }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class CardDetails { String cardNumber; String holderName; Double limit; }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class Balance { Double available; Double pending; }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class PostingRequest { String cardNumber; Double amount; String reference; }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class PostingResult { String transactionId; String status; }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class ReversalRequest { String transactionId; String reason; }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    static class ReversalResult { boolean success; }
+
+    // Simulated repository
+    interface TransactionRepository {
+        void save(Object transaction);
+        void incrementFailureCount(String cardNumber);
+        Mono<Void> saveAsync(Object transaction);
+        Mono<Void> incrementFailureCountAsync(String cardNumber);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 1. SEQUENTIAL THEN FIRE-AND-FORGET PARALLEL
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Pattern: Do sequential work, then fire off parallel tasks without waiting
+     */
+    public static void sequentialThenFireAndForget(CBQRestClient client) {
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 1.1: Sequential processing, then fire-and-forget notifications
+        // ─────────────────────────────────────────────────────────────────
+        PostingResult result = CBQWorkflow
+                // Step 1: Check status (sequential)
+                .startWith(() -> client.get()
+                        .uri("/status")
+                        .retrieve(Status.class))
+                // Step 2: Process payment (sequential)
+                .step(status -> client.post()
+                        .uri("/payments/process")
+                        .bodyValue(new PostingRequest("1234", 100.0, "REF001"))
+                        .retrieve(PostingResult.class))
+                // Fire and forget: Send notifications in parallel (non-blocking)
+                .fireAndForget(
+                        () -> client.post().uri("/notify/email").bodyValue("Payment done").retrieve(Void.class),
+                        () -> client.post().uri("/notify/sms").bodyValue("Payment done").retrieve(Void.class),
+                        () -> client.post().uri("/audit/log").bodyValue("Payment logged").retrieve(Void.class)
+                )
+                .execute();
+
+        System.out.println("Payment done: " + result.getTransactionId());
+        // Fire-and-forget tasks are running in background
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 1.2: Fire-and-forget with result data
+        // ─────────────────────────────────────────────────────────────────
+        CBQWorkflow
+                .startWith(() -> client.post()
+                        .uri("/orders/create")
+                        .bodyValue(new Object())
+                        .retrieve(PostingResult.class))
+                // Fire-and-forget that uses the result
+                .fireAndForgetWith(result2 -> client.post()
+                        .uri("/analytics/track")
+                        .bodyValue("Order created: " + result2.getTransactionId())
+                        .retrieve(Void.class)
+                        .then())
+                .execute();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 2. SYNC AND ASYNC DB CALLS IN WORKFLOW
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Pattern: Mix HTTP calls with sync/async database operations
+     */
+    public static void dbCallsInWorkflow(CBQRestClient client, TransactionRepository repository) {
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 2.1: SYNC DB call in sequential step (blocking, runs on bounded elastic)
+        // ─────────────────────────────────────────────────────────────────
+        CBQWorkflow
+                .startWith(() -> client.post()
+                        .uri("/payments/process")
+                        .bodyValue(new PostingRequest("1234", 100.0, "REF001"))
+                        .retrieve(PostingResult.class))
+                // SYNC DB save - blocks but runs on separate thread pool
+                .stepSync(result -> {
+                    repository.save(result);  // Blocking JPA/JDBC call
+                    return result;
+                })
+                .execute();
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 2.2: ASYNC DB call in sequential step (reactive, non-blocking)
+        // ─────────────────────────────────────────────────────────────────
+        CBQWorkflow
+                .startWith(() -> client.post()
+                        .uri("/payments/process")
+                        .bodyValue(new PostingRequest("1234", 100.0, "REF001"))
+                        .retrieve(PostingResult.class))
+                // ASYNC DB save - reactive R2DBC or similar
+                .stepMono(result -> repository.saveAsync(result).thenReturn(result))
+                .execute();
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 2.3: Fire-and-forget SYNC DB call
+        // ─────────────────────────────────────────────────────────────────
+        CBQWorkflow
+                .startWith(() -> client.post()
+                        .uri("/payments/process")
+                        .bodyValue(new PostingRequest("1234", 100.0, "REF001"))
+                        .retrieve(PostingResult.class))
+                // Fire-and-forget sync DB call
+                .fireAndForgetSync(
+                        () -> repository.save("audit log entry"),  // Runs async
+                        () -> repository.save("analytics entry")
+                )
+                .execute();
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 2.4: Fire-and-forget ASYNC DB call
+        // ─────────────────────────────────────────────────────────────────
+        CBQWorkflow
+                .startWith(() -> client.post()
+                        .uri("/payments/process")
+                        .bodyValue(new PostingRequest("1234", 100.0, "REF001"))
+                        .retrieve(PostingResult.class))
+                // Fire-and-forget async DB call
+                .fireAndForgetMono(
+                        () -> repository.saveAsync("audit entry"),
+                        () -> repository.saveAsync("metrics entry")
+                )
+                .execute();
+
+        // ─────────────────────────────────────────────────────────────────
+        // Example 2.5: Mixed HTTP and DB in same workflow
+        // ─────────────────────────────────────────────────────────────────
+        CBQWorkflow
+                // HTTP call
+                .startWith(() -> client.get()
+                        .uri("/users/123")
+                        .retrieve(Status.class))
+                // SYNC DB lookup
+                .stepSync(status -> {
+                    // Blocking DB call to enrich data
+                    return status;
+                })
+                // HTTP call with enriched data
+                .step(enrichedStatus -> client.post()
+                        .uri("/process")
+                        .bodyValue(enrichedStatus)
+                        .retrieve(PostingResult.class))
+                // ASYNC DB save
+                .stepMono(result -> repository.saveAsync(result).thenReturn(result))
+                // Fire-and-forget notifications
+                .fireAndForget(
+                        () -> client.post().uri("/notify").retrieve(Void.class)
+                )
+                .execute();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 3. USE CASE: Card Payment with Reversal on Failure
+    // 
+    // check status[GET] -> fetch card details[POST] -> check balance[POST] 
+    // -> make posting[POST] -> on failure, trigger reversal
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static PostingResult cardPaymentWithReversal(
+            CBQRestClient client,
+            String cardNumber,
+            Double amount,
+            TransactionRepository repository) {
+
+        // Track transaction ID for potential reversal
+        final String[] transactionIdHolder = new String[1];
+
+        return CBQWorkflow
+                // Step 1: Check status [GET]
+                .startWith(() -> client.get()
+                        .uri("/card/status/" + cardNumber)
+                        .retrieve(Status.class))
+
+                // Step 2: Fetch card details [POST]
+                .step(status -> {
+                    if (!status.isActive()) {
+                        return Mono.error(new RuntimeException("Card is not active"));
+                    }
+                    return client.post()
+                            .uri("/card/details")
+                            .bodyValue(new CardDetailsRequest(cardNumber))
+                            .retrieve(CardDetails.class);
+                })
+
+                // Step 3: Check balance [POST]
+                .step(cardDetails -> {
+                    if (cardDetails.getLimit() < amount) {
+                        return Mono.error(new RuntimeException("Insufficient limit"));
+                    }
+                    return client.post()
+                            .uri("/card/balance")
+                            .bodyValue(new BalanceRequest(cardNumber))
+                            .retrieve(Balance.class);
+                })
+
+                // Step 4: Make posting [POST]
+                .step(balance -> {
+                    if (balance.getAvailable() < amount) {
+                        return Mono.error(new RuntimeException("Insufficient balance"));
+                    }
+                    return client.post()
+                            .uri("/card/posting")
+                            .bodyValue(new PostingRequest(cardNumber, amount, "TXN-" + System.currentTimeMillis()))
+                            .override(o -> o.disableRetry())  // Don't retry posting
+                            .retrieve(PostingResult.class);
+                })
+
+                // Store transaction ID for potential reversal
+                .stepMono(result -> {
+                    transactionIdHolder[0] = result.getTransactionId();
+                    return Mono.just(result);
+                })
+
+                // On failure: Trigger reversal
+                .onFailure(error -> {
+                    log.error("Payment failed: {}", error.getMessage());
+                    
+                    // Only reverse if we got a transaction ID (posting was attempted)
+                    if (transactionIdHolder[0] != null) {
+                        return client.post()
+                                .uri("/card/reversal")
+                                .bodyValue(new ReversalRequest(transactionIdHolder[0], error.getMessage()))
+                                .override(o -> o.disableRetry())
+                                .retrieve(ReversalResult.class)
+                                .doOnNext(r -> log.info("Reversal result: {}", r.isSuccess()))
+                                .then();
+                    }
+                    return Mono.empty();
+                })
+
+                // Fire-and-forget: Audit and notify
+                .fireAndForget(
+                        () -> client.post().uri("/audit/payment").retrieve(Void.class),
+                        () -> client.post().uri("/notify/customer").retrieve(Void.class)
+                )
+
+                .execute();
+    }
+
+    // Helper classes for the workflow
+    @Data @AllArgsConstructor
+    static class CardDetailsRequest { String cardNumber; }
+    
+    @Data @AllArgsConstructor
+    static class BalanceRequest { String cardNumber; }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 4. USE CASE: Posting with Non-Blocking Secondary Call and Async DB Update
+    // 
+    // make posting[POST] -> call another[POST] (wait but don't fail if error)
+    // -> on failure -> Update a db count async
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static PostingResult postingWithSecondaryCall(
+            CBQRestClient client,
+            PostingRequest request,
+            TransactionRepository repository) {
+
+        return CBQWorkflow
+                // Step 1: Make posting [POST] - this is the critical step
+                .startWith(() -> client.post()
+                        .uri("/posting/create")
+                        .bodyValue(request)
+                        .override(o -> o.disableRetry())
+                        .retrieve(PostingResult.class))
+
+                // Step 2: Call another service [POST]
+                // WAIT for this call BUT if error, does NOT stop the successful posting
+                .stepContinueOnError(
+                        result -> client.post()
+                                .uri("/secondary/process")
+                                .bodyValue(result)
+                                .retrieve(Void.class),
+                        // On error of secondary call: Update DB count async
+                        error -> {
+                            log.warn("Secondary call failed: {}", error.getMessage());
+                            // Fire-and-forget async DB update
+                            repository.incrementFailureCountAsync(request.getCardNumber())
+                                    .subscribeOn(Schedulers.boundedElastic())
+                                    .subscribe();
+                        }
+                )
+
+                .execute();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 5. ALTERNATIVE: Using stepContinueOnError with sync DB
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static PostingResult postingWithSecondaryCallSyncDb(
+            CBQRestClient client,
+            PostingRequest request,
+            TransactionRepository repository) {
+
+        return CBQWorkflow
+                // Step 1: Make posting
+                .startWith(() -> client.post()
+                        .uri("/posting/create")
+                        .bodyValue(request)
+                        .retrieve(PostingResult.class))
+
+                // Step 2: Secondary call - continues on error
+                .stepContinueOnError(
+                        result -> client.post()
+                                .uri("/secondary/process")
+                                .bodyValue(result)
+                                .retrieve(Void.class),
+                        // Sync DB update on error (runs on bounded elastic)
+                        error -> {
+                            log.warn("Secondary call failed, updating DB: {}", error.getMessage());
+                            repository.incrementFailureCount(request.getCardNumber());
+                        }
+                )
+
+                // Fire-and-forget notifications
+                .fireAndForget(
+                        () -> client.post().uri("/notify").retrieve(Void.class)
+                )
+
+                .execute();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 6. MORE WORKFLOW PATTERNS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Pattern: Multiple sequential calls then multiple fire-and-forget
+     */
+    public static void multipleSequentialThenParallel(CBQRestClient client) {
+        CBQWorkflow
+                .startWith(() -> client.get().uri("/step1").retrieve(String.class))
+                .step(r1 -> client.get().uri("/step2").retrieve(String.class))
+                .step(r2 -> client.get().uri("/step3").retrieve(String.class))
+                .step(r3 -> client.post().uri("/final").bodyValue(r3).retrieve(String.class))
+                // All these run in parallel, fire-and-forget
+                .fireAndForget(
+                        () -> client.post().uri("/notify/a").retrieve(Void.class),
+                        () -> client.post().uri("/notify/b").retrieve(Void.class),
+                        () -> client.post().uri("/notify/c").retrieve(Void.class),
+                        () -> client.post().uri("/audit").retrieve(Void.class),
+                        () -> client.post().uri("/analytics").retrieve(Void.class)
+                )
+                .execute();
+    }
+
+    /**
+     * Pattern: Conditional fire-and-forget based on result
+     */
+    public static void conditionalFireAndForget(CBQRestClient client) {
+        CBQWorkflow
+                .startWith(() -> client.post()
+                        .uri("/orders/create")
+                        .retrieve(PostingResult.class))
+                .fireAndForgetWith(result -> {
+                    // Conditional notification based on result
+                    if ("HIGH_VALUE".equals(result.getStatus())) {
+                        return client.post()
+                                .uri("/notify/vip")
+                                .bodyValue(result)
+                                .retrieve(Void.class).then();
+                    } else {
+                        return client.post()
+                                .uri("/notify/standard")
+                                .bodyValue(result)
+                                .retrieve(Void.class).then();
+                    }
+                })
+                .execute();
+    }
+
+    /**
+     * Pattern: Full workflow with error handling at each step
+     */
+    public static void fullWorkflowWithErrorHandling(
+            CBQRestClient client,
+            TransactionRepository repository) {
+
+        CBQWorkflow
+                // Main processing
+                .startWith(() -> client.get().uri("/validate").retrieve(Status.class))
+                .step(status -> client.post().uri("/process").retrieve(PostingResult.class))
+                
+                // Secondary call that doesn't stop main flow
+                .stepContinueOnError(
+                        result -> client.post().uri("/enrich").retrieve(PostingResult.class),
+                        error -> log.warn("Enrichment failed: {}", error.getMessage())
+                )
+
+                // Success actions (fire-and-forget)
+                .fireAndForget(
+                        () -> client.post().uri("/notify").retrieve(Void.class)
+                )
+                .fireAndForgetMono(
+                        () -> repository.saveAsync("audit")
+                )
+
+                // Failure handler (rollback)
+                .onFailure(error -> {
+                    log.error("Workflow failed: {}", error.getMessage());
+                    return client.post()
+                            .uri("/rollback")
+                            .bodyValue(error.getMessage())
+                            .retrieve(Void.class).then();
+                })
+
+                // Custom handler for fire-and-forget errors
+                .onFireAndForgetError(error ->
+                        log.error("Background task failed: {}", error.getMessage()))
+
+                .execute();
+    }
+
+    /**
+     * Pattern: Async workflow (non-blocking)
+     */
+    public static void asyncWorkflow(CBQRestClient client) {
+        // Non-blocking - returns immediately
+        CBQWorkflow
+                .startWith(() -> client.post().uri("/process").retrieve(PostingResult.class))
+                .fireAndForget(
+                        () -> client.post().uri("/notify").retrieve(Void.class)
+                )
+                .executeAsync()  // Returns Mono<PostingResult>
+                .subscribe(
+                        result -> log.info("Async workflow completed: {}", result),
+                        error -> log.error("Async workflow failed: {}", error.getMessage())
+                );
+    }
+
+    /**
+     * Pattern: Execute and forget (for background jobs)
+     */
+    public static void backgroundJob(CBQRestClient client) {
+        // Fire completely in background, don't wait
+        CBQWorkflow
+                .startWith(() -> client.post().uri("/batch/process").retrieve(Void.class))
+                .fireAndForget(
+                        () -> client.post().uri("/notify/complete").retrieve(Void.class)
+                )
+                .onFailure(error -> client.post().uri("/notify/failed").retrieve(Void.class).then())
+                .executeAndForget();  // Returns immediately, runs in background
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MAIN
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static void main(String[] args) {
+        CBQRestClient client = CBQRestClientBuilder.builder("workflow-client")
+                .baseUrl("https://api.example.com")
+                .build();
+
+        // Run examples...
+        
+        client.shutdown();
+    }
+}
