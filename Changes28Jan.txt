@@ -1,0 +1,1292 @@
+package com.cbq.restclient.logging;
+
+import com.cbq.restclient.config.LoggingConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Production-safe logging service with:
+ * - JSON format (Stripe-style, Splunk-friendly)
+ * - Pretty format (human-readable)
+ * - Correlation ID tracking across all calls
+ * - Max body size limits
+ * - Async logging (never blocks Netty)
+ * - Field masking for sensitive data
+ */
+public class LoggingService {
+    private static final Logger log = LoggerFactory.getLogger(LoggingService.class);
+    
+    private final LoggingConfig config;
+    private final ObjectMapper objectMapper;
+    private final Scheduler loggingScheduler;
+    
+    // Pre-computed lowercase sets for efficient lookup
+    private final Set<String> fieldsToMaskLower;
+    private final Set<String> fieldsToExcludeLower;
+    
+    // Pattern for masking in non-JSON content
+    private final Map<String, Pattern> maskPatterns = new HashMap<>();
+
+    public LoggingService(LoggingConfig config) {
+        this.config = config;
+        this.objectMapper = new ObjectMapper();
+        this.loggingScheduler = Schedulers.newBoundedElastic(2, 100, "cbq-logging");
+        
+        // Pre-compute lowercase sets at startup
+        this.fieldsToMaskLower = new HashSet<>();
+        for (String field : config.getFieldsToMask()) {
+            this.fieldsToMaskLower.add(field.toLowerCase());
+        }
+        
+        this.fieldsToExcludeLower = new HashSet<>();
+        for (String field : config.getFieldsToExclude()) {
+            this.fieldsToExcludeLower.add(field.toLowerCase());
+        }
+        
+        // Build mask patterns
+        for (String field : fieldsToMaskLower) {
+            String pattern = String.format("(?i)(\"%s\"\\s*:\\s*\")[^\"]*(\"|$)", field);
+            maskPatterns.put(field, Pattern.compile(pattern));
+        }
+    }
+
+    /**
+     * Logs request asynchronously - returns Mono for chaining if needed.
+     * Prefer {@link #logRequest} for fire-and-forget logging.
+     */
+    public Mono<Void> logRequestAsync(String requestId, String correlationId, String method, 
+                                       String uri, HttpHeaders headers, Object body, 
+                                       String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogRequest()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> doLogRequest(requestId, correlationId, method, uri, 
+                headers, body, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logRequestAsync(String requestId, String method, String uri,
+                                       HttpHeaders headers, Object body, String contentType) {
+        return logRequestAsync(requestId, null, method, uri, headers, body, contentType, "http");
+    }
+
+    /**
+     * Logs response asynchronously - returns Mono for chaining if needed.
+     * Prefer {@link #logResponse} for fire-and-forget logging.
+     */
+    public Mono<Void> logResponseAsync(String requestId, String correlationId, int status, 
+                                        HttpHeaders headers, String body, long durationMs, 
+                                        String contentType, String taskType) {
+        if (!config.isEnabled() || !config.isLogResponse()) {
+            return Mono.empty();
+        }
+        
+        return Mono.fromRunnable(() -> doLogResponse(requestId, correlationId, status, headers, 
+                body, durationMs, contentType, taskType))
+                .subscribeOn(loggingScheduler)
+                .then();
+    }
+    
+    // Backward compatible overload
+    public Mono<Void> logResponseAsync(String requestId, int status, HttpHeaders headers,
+                                        String body, long durationMs, String contentType) {
+        return logResponseAsync(requestId, null, status, headers, body, durationMs, contentType, "http");
+    }
+
+    /**
+     * Fire-and-forget request logging.
+     * Non-blocking: offloads to dedicated scheduler internally.
+     */
+    public void logRequest(String requestId, String correlationId, String method, String uri,
+                          HttpHeaders headers, Object body, String contentType) {
+        if (!config.isEnabled() || !config.isLogRequest()) {
+            return;
+        }
+        loggingScheduler.schedule(() -> 
+            doLogRequest(requestId, correlationId, method, uri, headers, body, contentType, "http"));
+    }
+
+    /**
+     * Fire-and-forget response logging.
+     * Non-blocking: offloads to dedicated scheduler internally.
+     */
+    public void logResponse(String requestId, String correlationId, int status, HttpHeaders headers,
+                           String body, long durationMs, String contentType) {
+        if (!config.isEnabled() || !config.isLogResponse()) {
+            return;
+        }
+        loggingScheduler.schedule(() -> 
+            doLogResponse(requestId, correlationId, status, headers, body, durationMs, contentType, "http"));
+    }
+
+    private void doLogRequest(String requestId, String correlationId, String method, String uri,
+                             HttpHeaders headers, Object body, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logRequestJson(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        } else {
+            logRequestPretty(requestId, correlationId, method, uri, headers, body, contentType, taskType);
+        }
+    }
+
+    private void doLogResponse(String requestId, String correlationId, int status, HttpHeaders headers,
+                              String body, long durationMs, String contentType, String taskType) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logResponseJson(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        } else {
+            logResponsePretty(requestId, correlationId, status, headers, body, durationMs, contentType, taskType);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // JSON FORMAT (Stripe-style, Splunk-friendly)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestJson(String requestId, String correlationId, String method, String uri,
+                                HttpHeaders headers, Object body, String contentType, String taskType) {
+        logRequestJson(requestId, correlationId, null, method, uri, headers, body, contentType, taskType);
+    }
+
+    private void logRequestJson(String requestId, String correlationId, String traceId, String method, String uri,
+                                HttpHeaders headers, Object body, String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            
+            // Standard fields (Splunk/ELK friendly)
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("level", "INFO");
+            logNode.put("service", config.getServiceName());
+            logNode.put("version", config.getServiceVersion());
+            logNode.put("env", config.getEnvironment().getValue());
+            logNode.put("host", config.getHost());
+            
+            // Event classification
+            logNode.put("event", "http_request");
+            logNode.put("span_kind", "client");  // outgoing request
+            
+            // Identifiers
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            if (traceId != null) {
+                logNode.put("trace_id", traceId);
+            }
+            
+            // Request details
+            logNode.put("task_type", taskType);
+            logNode.put("method", method);
+            logNode.put("uri", uri);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        String value = maskHeaderValue(name, String.join(", ", values));
+                        headersNode.put(name, value);
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String bodyStr = formatBodyCompact(body);
+                String maskedBody = maskBodyCompact(bodyStr);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logResponseJson(String requestId, String correlationId, int status, 
+                                 HttpHeaders headers, String body, long durationMs, 
+                                 String contentType, String taskType) {
+        logResponseJson(requestId, correlationId, null, status, headers, body, durationMs, contentType, taskType);
+    }
+
+    private void logResponseJson(String requestId, String correlationId, String traceId, int status, 
+                                 HttpHeaders headers, String body, long durationMs, 
+                                 String contentType, String taskType) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            
+            // Standard fields
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("level", status >= 400 ? (status >= 500 ? "ERROR" : "WARN") : "INFO");
+            logNode.put("service", config.getServiceName());
+            logNode.put("version", config.getServiceVersion());
+            logNode.put("env", config.getEnvironment().getValue());
+            logNode.put("host", config.getHost());
+            
+            // Event classification
+            logNode.put("event", "http_response");
+            logNode.put("span_kind", "client");
+            
+            // Identifiers
+            logNode.put("request_id", requestId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            if (traceId != null) {
+                logNode.put("trace_id", traceId);
+            }
+            
+            // Response details
+            logNode.put("task_type", taskType);
+            logNode.put("status", status);
+            logNode.put("duration_ms", durationMs);
+            
+            if (config.isLogHeaders() && headers != null) {
+                ObjectNode headersNode = objectMapper.createObjectNode();
+                headers.forEach((name, values) -> {
+                    if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                        headersNode.put(name, String.join(", ", values));
+                    }
+                });
+                logNode.set("headers", headersNode);
+            }
+            
+            if (body != null && shouldLogBody(contentType)) {
+                String maskedBody = maskBodyCompact(body);
+                String truncatedBody = truncateBody(maskedBody);
+                try {
+                    JsonNode bodyNode = objectMapper.readTree(truncatedBody);
+                    logNode.set("body", bodyNode);
+                } catch (Exception e) {
+                    logNode.put("body", truncatedBody);
+                }
+            }
+            
+            log.info(objectMapper.writeValueAsString(logNode));
+        } catch (Exception e) {
+            log.warn("Failed to create JSON log: {}", e.getMessage());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRETTY FORMAT (Human-readable)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void logRequestPretty(String requestId, String correlationId, String method, String uri,
+                                  HttpHeaders headers, Object body, String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP REQUEST [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Method: ").append(method).append("\n");
+        sb.append("║ URI: ").append(uri).append("\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    value = maskHeaderValue(name, value);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String bodyStr = formatBody(body, contentType);
+            sb.append("║ Body:\n").append(bodyStr).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    private void logResponsePretty(String requestId, String correlationId, int status, 
+                                   HttpHeaders headers, String body, long durationMs, 
+                                   String contentType, String taskType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ HTTP RESPONSE [").append(taskType.toUpperCase()).append("]\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Request ID: ").append(requestId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Status: ").append(status).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (config.isLogHeaders() && headers != null) {
+            sb.append("║ Headers:\n");
+            headers.forEach((name, values) -> {
+                if (!fieldsToExcludeLower.contains(name.toLowerCase())) {
+                    String value = String.join(", ", values);
+                    sb.append("║   ").append(name).append(": ").append(value).append("\n");
+                }
+            });
+        }
+        
+        if (body != null && shouldLogBody(contentType)) {
+            String maskedBody = maskBody(body);
+            String truncatedBody = truncateBody(maskedBody);
+            sb.append("║ Body:\n").append(truncatedBody).append("\n");
+        } else if (body != null) {
+            sb.append("║ Body: [").append(contentType).append(" - not logged]\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        log.info(sb.toString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private boolean shouldLogBody(String contentType) {
+        return LoggingConfig.shouldLogContentType(contentType);
+    }
+
+    private String formatBody(Object body, String contentType) {
+        if (body == null) return "";
+        
+        String bodyStr;
+        if (body instanceof String) {
+            bodyStr = (String) body;
+        } else {
+            try {
+                bodyStr = objectMapper.writeValueAsString(body);
+            } catch (JsonProcessingException e) {
+                bodyStr = body.toString();
+            }
+        }
+        
+        return truncateBody(maskBody(bodyStr));
+    }
+    
+    private String formatBodyCompact(Object body) {
+        if (body == null) return "";
+        
+        if (body instanceof String) {
+            return (String) body;
+        }
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            return body.toString();
+        }
+    }
+
+    private String maskBody(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String maskBodyCompact(String body) {
+        if (body == null || body.isEmpty()) return body;
+        
+        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
+            try {
+                JsonNode node = objectMapper.readTree(body);
+                maskJsonNode(node);
+                return objectMapper.writeValueAsString(node);  // Compact, no pretty print
+            } catch (Exception e) {
+                log.debug("JSON parsing failed: {}", e.getMessage());
+            }
+        }
+        
+        return applyPatternMasking(body);
+    }
+    
+    private String applyPatternMasking(String body) {
+        String masked = body;
+        for (Map.Entry<String, Pattern> entry : maskPatterns.entrySet()) {
+            Matcher matcher = entry.getValue().matcher(masked);
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    entry.getKey().toLowerCase(), config.getDefaultVisibleChars());
+            masked = matcher.replaceAll("$1" + generateMask(visibleChars) + "$2");
+        }
+        return masked;
+    }
+
+    private void maskJsonNode(JsonNode node) {
+        if (node == null) return;
+        
+        if (node.isObject()) {
+            ObjectNode objNode = (ObjectNode) node;
+            Iterator<String> fieldNames = objNode.fieldNames();
+            List<String> names = new ArrayList<>();
+            fieldNames.forEachRemaining(names::add);
+            
+            for (String fieldName : names) {
+                String fieldNameLower = fieldName.toLowerCase();
+                
+                if (fieldsToExcludeLower.contains(fieldNameLower)) {
+                    objNode.remove(fieldName);
+                    continue;
+                }
+                
+                boolean shouldMask = fieldsToMaskLower.contains(fieldNameLower) ||
+                        shouldMaskPartial(fieldNameLower);
+                
+                if (shouldMask) {
+                    int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                            fieldNameLower, config.getDefaultVisibleChars());
+                    JsonNode valueNode = objNode.get(fieldName);
+                    if (valueNode != null && valueNode.isTextual()) {
+                        String value = valueNode.asText();
+                        objNode.put(fieldName, maskValue(value, visibleChars));
+                    } else if (valueNode != null && !valueNode.isNull()) {
+                        objNode.put(fieldName, generateMask(0));
+                    }
+                } else {
+                    maskJsonNode(objNode.get(fieldName));
+                }
+            }
+        } else if (node.isArray()) {
+            for (JsonNode element : node) {
+                maskJsonNode(element);
+            }
+        }
+    }
+    
+    private boolean shouldMaskPartial(String fieldNameLower) {
+        for (String maskField : fieldsToMaskLower) {
+            if (fieldNameLower.contains(maskField) || maskField.contains(fieldNameLower)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String maskValue(String value, int visibleChars) {
+        if (value == null || value.length() <= visibleChars * 2) {
+            return generateMask(0);
+        }
+        
+        String mask = String.valueOf(config.getMaskSymbol()).repeat(
+                Math.min(8, value.length() - visibleChars * 2));
+        
+        if (visibleChars > 0) {
+            return value.substring(0, visibleChars) + mask + 
+                   value.substring(value.length() - visibleChars);
+        }
+        return mask;
+    }
+
+    private String generateMask(int visibleChars) {
+        return String.valueOf(config.getMaskSymbol()).repeat(8);
+    }
+
+    private String maskHeaderValue(String headerName, String value) {
+        String lowerName = headerName.toLowerCase();
+        if (fieldsToMaskLower.contains(lowerName) || 
+            lowerName.contains("authorization") || 
+            lowerName.contains("token") ||
+            lowerName.contains("api-key") ||
+            lowerName.contains("apikey")) {
+            int visibleChars = config.getFieldMaskLengths().getOrDefault(
+                    lowerName, config.getDefaultVisibleChars());
+            return maskValue(value, visibleChars);
+        }
+        return value;
+    }
+
+    private String truncateBody(String body) {
+        if (body == null) return "";
+        
+        int maxSize = config.getMaxBodySize();
+        if (body.length() <= maxSize) {
+            return body;
+        }
+        
+        return body.substring(0, maxSize) + "...[TRUNCATED]";
+    }
+
+    public void logError(String requestId, String correlationId, String method, String uri, 
+                        Throwable error, long durationMs) {
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            try {
+                ObjectNode logNode = objectMapper.createObjectNode();
+                
+                // Standard fields
+                logNode.put("timestamp", Instant.now().toString());
+                logNode.put("level", "ERROR");
+                logNode.put("service", config.getServiceName());
+                logNode.put("version", config.getServiceVersion());
+                logNode.put("env", config.getEnvironment().getValue());
+                logNode.put("host", config.getHost());
+                
+                // Event classification
+                logNode.put("event", "http_error");
+                logNode.put("span_kind", "client");
+                
+                // Identifiers
+                logNode.put("request_id", requestId);
+                if (correlationId != null) {
+                    logNode.put("correlation_id", correlationId);
+                }
+                
+                // Request details
+                logNode.put("method", method);
+                logNode.put("uri", uri);
+                logNode.put("duration_ms", durationMs);
+                
+                // Error details
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+                
+                log.error(objectMapper.writeValueAsString(logNode));
+            } catch (Exception e) {
+                log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+            }
+        } else {
+            log.error("Request {} {} failed after {}ms: {}", method, uri, durationMs, error.getMessage(), error);
+        }
+    }
+    
+    // Backward compatible
+    public void logError(String requestId, String method, String uri, Throwable error, long durationMs) {
+        logError(requestId, null, method, uri, error, durationMs);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TASK LOGGING (DB, Email, etc.)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Log a generic task (DB call, email, file operation, etc.)
+     * 
+     * @param correlationId Shared ID across all calls in workflow
+     * @param taskType Type: "db", "email", "file", "cache", etc.
+     * @param operation Operation name: "save", "find", "send", etc.
+     * @param target Target: table name, email recipient, file path, etc.
+     * @param data Optional data to log (will be masked)
+     * @param durationMs How long it took
+     * @param success Whether it succeeded
+     * @param error Error if failed (null if success)
+     */
+    public void logTask(String correlationId, String taskType, String operation, 
+                       String target, Object data, long durationMs, 
+                       boolean success, Throwable error) {
+        if (!config.isEnabled()) return;
+        
+        String taskId = "task_" + UUID.randomUUID().toString().substring(0, 8);
+        
+        if (config.getFormat() == LoggingConfig.LogFormat.JSON) {
+            logTaskJson(taskId, correlationId, taskType, operation, target, data, durationMs, success, error);
+        } else {
+            logTaskPretty(taskId, correlationId, taskType, operation, target, data, durationMs, success, error);
+        }
+    }
+
+    private void logTaskJson(String taskId, String correlationId, String taskType, 
+                            String operation, String target, Object data, 
+                            long durationMs, boolean success, Throwable error) {
+        try {
+            ObjectNode logNode = objectMapper.createObjectNode();
+            
+            // Standard fields
+            logNode.put("timestamp", Instant.now().toString());
+            logNode.put("level", success ? "INFO" : "ERROR");
+            logNode.put("service", config.getServiceName());
+            logNode.put("version", config.getServiceVersion());
+            logNode.put("env", config.getEnvironment().getValue());
+            logNode.put("host", config.getHost());
+            
+            // Event classification
+            logNode.put("event", taskType + "_" + operation);
+            logNode.put("span_kind", "internal");
+            
+            // Identifiers
+            logNode.put("task_id", taskId);
+            if (correlationId != null) {
+                logNode.put("correlation_id", correlationId);
+            }
+            
+            // Task details
+            logNode.put("task_type", taskType);
+            logNode.put("operation", operation);
+            logNode.put("target", target);
+            logNode.put("duration_ms", durationMs);
+            logNode.put("success", success);
+            
+            if (data != null) {
+                String dataStr = formatBodyCompact(data);
+                String maskedData = maskBodyCompact(dataStr);
+                try {
+                    JsonNode dataNode = objectMapper.readTree(maskedData);
+                    logNode.set("data", dataNode);
+                } catch (Exception e) {
+                    logNode.put("data", maskedData);
+                }
+            }
+            
+            if (error != null) {
+                logNode.put("error", error.getClass().getSimpleName());
+                logNode.put("error_message", error.getMessage());
+            }
+            
+            if (success) {
+                log.info(objectMapper.writeValueAsString(logNode));
+            } else {
+                log.error(objectMapper.writeValueAsString(logNode));
+            }
+        } catch (Exception e) {
+            log.warn("Failed to create task JSON log: {}", e.getMessage());
+        }
+    }
+
+    private void logTaskPretty(String taskId, String correlationId, String taskType,
+                              String operation, String target, Object data,
+                              long durationMs, boolean success, Throwable error) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n╔══════════════════════════════════════════════════════════════════╗\n");
+        sb.append("║ CBQ TASK [").append(taskType.toUpperCase()).append("] - ")
+          .append(success ? "SUCCESS" : "FAILED").append("\n");
+        sb.append("╠══════════════════════════════════════════════════════════════════╣\n");
+        sb.append("║ Task ID: ").append(taskId).append("\n");
+        if (correlationId != null) {
+            sb.append("║ Correlation ID: ").append(correlationId).append("\n");
+        }
+        sb.append("║ Operation: ").append(operation).append("\n");
+        sb.append("║ Target: ").append(target).append("\n");
+        sb.append("║ Duration: ").append(durationMs).append("ms\n");
+        
+        if (data != null) {
+            String dataStr = formatBodyCompact(data);
+            String maskedData = maskBodyCompact(dataStr);
+            sb.append("║ Data: ").append(truncateBody(maskedData)).append("\n");
+        }
+        
+        if (error != null) {
+            sb.append("║ Error: ").append(error.getClass().getSimpleName())
+              .append(" - ").append(error.getMessage()).append("\n");
+        }
+        
+        sb.append("╚══════════════════════════════════════════════════════════════════╝");
+        
+        if (success) {
+            log.info(sb.toString());
+        } else {
+            log.error(sb.toString());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONVENIENCE METHODS FOR COMMON TASKS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Log a database operation
+     */
+    public void logDb(String correlationId, String operation, String table, 
+                     Object data, long durationMs) {
+        logTask(correlationId, "db", operation, table, data, durationMs, true, null);
+    }
+
+    public void logDbError(String correlationId, String operation, String table, 
+                          Object data, long durationMs, Throwable error) {
+        logTask(correlationId, "db", operation, table, data, durationMs, false, error);
+    }
+
+    /**
+     * Log an email operation
+     */
+    public void logEmail(String correlationId, String operation, String recipient, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "email", operation, recipient, data, durationMs, true, null);
+    }
+
+    public void logEmailError(String correlationId, String operation, String recipient, 
+                             Object data, long durationMs, Throwable error) {
+        logTask(correlationId, "email", operation, recipient, data, durationMs, false, error);
+    }
+
+    /**
+     * Log a cache operation
+     */
+    public void logCache(String correlationId, String operation, String key, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "cache", operation, key, data, durationMs, true, null);
+    }
+
+    /**
+     * Log a queue/message operation
+     */
+    public void logQueue(String correlationId, String operation, String queue, 
+                        Object data, long durationMs) {
+        logTask(correlationId, "queue", operation, queue, data, durationMs, true, null);
+    }
+
+    /**
+     * Log a file operation
+     */
+    public void logFile(String correlationId, String operation, String path, 
+                       long durationMs) {
+        logTask(correlationId, "file", operation, path, null, durationMs, true, null);
+    }
+
+    public void shutdown() {
+        loggingScheduler.dispose();
+    }
+}
+
+
+
+package com.cbq.restclient.core;
+
+import com.cbq.restclient.config.*;
+import com.cbq.restclient.email.EmailNotifier;
+import com.cbq.restclient.exception.CBQRestClientException;
+import com.cbq.restclient.filter.*;
+import com.cbq.restclient.logging.LoggingService;
+import com.cbq.restclient.model.*;
+import com.cbq.restclient.resilience.ResilienceManager;
+import com.cbq.restclient.ssl.SslContextFactory;
+import com.cbq.restclient.tracing.TracingService;
+import io.netty.channel.ChannelOption;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.*;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+import reactor.netty.http.client.HttpClient;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+/**
+ * Production-ready HTTP client with full resilience, observability, and safety features.
+ */
+public class CBQRestClient {
+    private static final Logger log = LoggerFactory.getLogger(CBQRestClient.class);
+
+    private final CBQRestClientConfig config;
+    private final WebClient webClient;
+    private final ResilienceManager resilienceManager;
+    private final LoggingService loggingService;
+    private final EmailNotifier emailNotifier;
+    private final TracingService tracingService;
+    private final Scheduler parallelScheduler;
+
+    CBQRestClient(CBQRestClientConfig config, WebClient webClient,
+                  ResilienceManager resilienceManager, LoggingService loggingService,
+                  EmailNotifier emailNotifier, TracingService tracingService) {
+        this.config = config;
+        this.webClient = webClient;
+        this.resilienceManager = resilienceManager;
+        this.loggingService = loggingService;
+        this.emailNotifier = emailNotifier;
+        this.tracingService = tracingService;
+        this.parallelScheduler = Schedulers.newBoundedElastic(
+                10, 100, "cbq-parallel-" + config.getName());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HTTP Methods
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public RequestSpec get() { return new RequestSpec(this, HttpMethod.GET); }
+    public RequestSpec post() { return new RequestSpec(this, HttpMethod.POST); }
+    public RequestSpec put() { return new RequestSpec(this, HttpMethod.PUT); }
+    public RequestSpec delete() { return new RequestSpec(this, HttpMethod.DELETE); }
+    public RequestSpec patch() { return new RequestSpec(this, HttpMethod.PATCH); }
+    public RequestSpec head() { return new RequestSpec(this, HttpMethod.HEAD); }
+    public RequestSpec options() { return new RequestSpec(this, HttpMethod.OPTIONS); }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Parallel & Sequential Execution
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    @SafeVarargs
+    public final <T> ParallelBuilder<T> parallel(Mono<CBQResponse<T>>... requests) {
+        return new ParallelBuilder<>(this, Arrays.asList(requests));
+    }
+
+    public SequenceBuilder sequence() {
+        return new SequenceBuilder(this);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Request Specification
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static class RequestSpec {
+        private final CBQRestClient client;
+        private final HttpMethod method;
+        private String uri = "";
+        private final HttpHeaders headers = new HttpHeaders();
+        private Object body;
+        private MediaType contentType = MediaType.APPLICATION_JSON;
+        private RequestOverride override;
+        private EmailNotification emailNotification;
+        private final List<ErrorMapper> errorMappers = new ArrayList<>();
+
+        RequestSpec(CBQRestClient client, HttpMethod method) {
+            this.client = client;
+            this.method = method;
+        }
+
+        public RequestSpec uri(String uri) {
+            this.uri = uri;
+            return this;
+        }
+
+        public RequestSpec uri(String template, Object... vars) {
+            this.uri = String.format(template.replace("{}", "%s"), vars);
+            return this;
+        }
+
+        public RequestSpec header(String name, String value) {
+            this.headers.add(name, value);
+            return this;
+        }
+
+        public RequestSpec headers(Consumer<HttpHeaders> consumer) {
+            consumer.accept(this.headers);
+            return this;
+        }
+
+        public RequestSpec bodyValue(Object body) {
+            this.body = body;
+            return this;
+        }
+
+        public RequestSpec contentType(MediaType contentType) {
+            this.contentType = contentType;
+            return this;
+        }
+
+        public RequestSpec override(Consumer<RequestOverride> configurer) {
+            this.override = RequestOverride.create();
+            configurer.accept(this.override);
+            return this;
+        }
+
+        public RequestSpec onStatus(java.util.function.Predicate<HttpStatus> predicate,
+                                   java.util.function.Function<ErrorMapper.ErrorContext, Throwable> mapper) {
+            this.errorMappers.add(ErrorMapper.onStatus(predicate, mapper));
+            return this;
+        }
+
+        public RequestSpec onErrorNotify(Consumer<EmailNotification> configurer) {
+            this.emailNotification = EmailNotification.create();
+            configurer.accept(this.emailNotification);
+            return this;
+        }
+
+        public <T> Mono<CBQResponse<T>> retrieve(Class<T> responseType) {
+            return client.execute(this, responseType);
+        }
+
+        public Mono<CBQResponse<String>> retrieve() {
+            return client.execute(this, String.class);
+        }
+
+        public <T> Mono<T> retrieveBody(Class<T> responseType) {
+            return retrieve(responseType).map(CBQResponse::getBody);
+        }
+
+        public <T> Flux<T> retrieveFlux(Class<T> responseType) {
+            return client.executeFlux(this, responseType);
+        }
+
+        // Getters for internal use
+        HttpMethod getMethod() { return method; }
+        String getUri() { return uri; }
+        HttpHeaders getHeaders() { return headers; }
+        Object getBody() { return body; }
+        MediaType getContentType() { return contentType; }
+        RequestOverride getOverride() { return override; }
+        EmailNotification getEmailNotification() { return emailNotification; }
+        List<ErrorMapper> getErrorMappers() { return errorMappers; }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Internal Execution
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    <T> Mono<CBQResponse<T>> execute(RequestSpec spec, Class<T> responseType) {
+        String requestId = tracingService.generateRequestId();
+        long startTime = System.currentTimeMillis();
+        String fullUrl = buildFullUrl(spec.getUri());
+
+        // Merge global headers with request headers (request headers override global)
+        HttpHeaders mergedHeaders = new HttpHeaders();
+        // 1. Add global default headers first
+        config.getDefaultHeaders().forEach(mergedHeaders::add);
+        // 2. Add request-specific headers (overrides global if same name)
+        spec.getHeaders().forEach((name, values) -> {
+            mergedHeaders.remove(name);  // Remove global header with same name
+            values.forEach(v -> mergedHeaders.add(name, v));
+        });
+
+        String correlationId = tracingService.getOrCreateCorrelationId(mergedHeaders);
+
+        // Apply request filters
+        RequestFilter.RequestContext reqCtx = new RequestFilter.RequestContext(
+                requestId, spec.getMethod(), spec.getUri(), mergedHeaders, 
+                spec.getBody(), new HashMap<>());
+
+        Mono<RequestFilter.RequestContext> filterChain = Mono.just(reqCtx);
+        for (RequestFilter filter : config.getRequestFilters()) {
+            filterChain = filterChain.flatMap(filter::filter);
+        }
+
+        return filterChain.flatMap(ctx -> {
+            // Add tracing headers
+            tracingService.addTracingHeaders(ctx.getHeaders(), correlationId);
+
+            // Log request (side-effect, non-blocking)
+            loggingService.logRequest(requestId, correlationId, ctx.getMethod().name(), fullUrl,
+                    ctx.getHeaders(), ctx.getBody(), 
+                    spec.getContentType() != null ? spec.getContentType().toString() : null);
+
+            // Build WebClient request
+            WebClient.RequestBodySpec requestSpec = webClient
+                    .method(ctx.getMethod())
+                    .uri(ctx.getUri());
+
+            ctx.getHeaders().forEach((name, values) -> 
+                    values.forEach(v -> requestSpec.header(name, v)));
+
+            WebClient.RequestHeadersSpec<?> headersSpec;
+            if (ctx.getBody() != null) {
+                headersSpec = requestSpec
+                        .contentType(spec.getContentType())
+                        .body(BodyInserters.fromValue(ctx.getBody()));
+            } else {
+                headersSpec = requestSpec;
+            }
+
+            // Execute with response timeout
+            Duration responseTimeout = getEffectiveTimeout(spec.getOverride());
+            Mono<CBQResponse<T>> responseMono = headersSpec
+                    .exchangeToMono(clientResponse -> 
+                            handleResponse(clientResponse, responseType, requestId, 
+                                    correlationId, spec, fullUrl, startTime))
+                    .timeout(responseTimeout);
+
+            // Apply resilience patterns
+            responseMono = resilienceManager.applyResilience(
+                    responseMono, spec.getOverride(), requestId, fullUrl, spec.getMethod().name());
+
+            // Handle errors
+            responseMono = responseMono.doOnError(error -> {
+                long duration = System.currentTimeMillis() - startTime;
+                loggingService.logError(requestId, spec.getMethod().name(), fullUrl, error, duration);
+                
+                // Notify via email if configured
+                if (spec.getEmailNotification() != null && emailNotifier != null) {
+                    emailNotifier.notify(
+                            new EmailNotifier.ErrorEvent(requestId, correlationId, 
+                                    spec.getMethod().name(), fullUrl, error, duration),
+                            spec.getEmailNotification());
+                }
+            });
+
+            return responseMono;
+        });
+    }
+
+    private <T> Mono<CBQResponse<T>> handleResponse(ClientResponse clientResponse,
+                                                     Class<T> responseType,
+                                                     String requestId,
+                                                     String correlationId,
+                                                     RequestSpec spec,
+                                                     String url,
+                                                     long startTime) {
+        HttpStatus status = clientResponse.statusCode();
+        HttpHeaders headers = clientResponse.headers().asHttpHeaders();
+
+        // Check for custom error mappers
+        List<ErrorMapper> mappers = new ArrayList<>(config.getErrorMappers());
+        mappers.addAll(spec.getErrorMappers());
+
+        for (ErrorMapper mapper : mappers) {
+            if (mapper.matches(status)) {
+                return clientResponse.bodyToMono(String.class)
+                        .defaultIfEmpty("")
+                        .flatMap(body -> {
+                            ErrorMapper.ErrorContext ctx = new ErrorMapper.ErrorContext(
+                                    requestId, status, spec.getMethod().name(), url, body, headers);
+                            return Mono.error(mapper.mapError(ctx));
+                        });
+            }
+        }
+
+        return clientResponse.bodyToMono(responseType)
+                .defaultIfEmpty(createEmptyResponse(responseType))
+                .map(body -> {
+                    long duration = System.currentTimeMillis() - startTime;
+
+                    // Log response (side-effect, non-blocking)
+                    String contentType = headers.getFirst(HttpHeaders.CONTENT_TYPE);
+                    loggingService.logResponse(requestId, correlationId, status.value(), headers,
+                            body != null ? body.toString() : null, duration, contentType);
+
+                    return CBQResponse.<T>builder()
+                            .body(body)
+                            .status(status)
+                            .headers(headers)
+                            .durationMs(duration)
+                            .requestId(requestId)
+                            .correlationId(correlationId)
+                            .build();
+                });
+    }
+
+    <T> Flux<T> executeFlux(RequestSpec spec, Class<T> responseType) {
+        // Merge global headers with request headers (request headers override global)
+        HttpHeaders mergedHeaders = new HttpHeaders();
+        config.getDefaultHeaders().forEach(mergedHeaders::add);
+        spec.getHeaders().forEach((name, values) -> {
+            mergedHeaders.remove(name);
+            values.forEach(v -> mergedHeaders.add(name, v));
+        });
+
+        WebClient.RequestBodySpec requestSpec = webClient
+                .method(spec.getMethod())
+                .uri(spec.getUri());
+
+        mergedHeaders.forEach((name, values) -> 
+                values.forEach(v -> requestSpec.header(name, v)));
+
+        WebClient.RequestHeadersSpec<?> headersSpec;
+        if (spec.getBody() != null) {
+            headersSpec = requestSpec
+                    .contentType(spec.getContentType())
+                    .body(BodyInserters.fromValue(spec.getBody()));
+        } else {
+            headersSpec = requestSpec;
+        }
+
+        return headersSpec.retrieve().bodyToFlux(responseType);
+    }
+
+    private Duration getEffectiveTimeout(RequestOverride override) {
+        if (override != null && override.getResponseTimeout() != null) {
+            return override.getResponseTimeout();
+        }
+        return config.getTimeouts().getResponseTimeout();
+    }
+
+    private String buildFullUrl(String uri) {
+        String baseUrl = config.getBaseUrl();
+        if (baseUrl != null && !baseUrl.isEmpty()) {
+            return uri.startsWith("/") ? baseUrl + uri : baseUrl + "/" + uri;
+        }
+        return uri;
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T createEmptyResponse(Class<T> type) {
+        if (type == String.class) return (T) "";
+        if (type == Void.class) return null;
+        try { return type.getDeclaredConstructor().newInstance(); } 
+        catch (Exception e) { return null; }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Parallel Builder
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static class ParallelBuilder<T> {
+        private final CBQRestClient client;
+        private final List<Mono<CBQResponse<T>>> requests;
+        private CBQParallelResult.ParallelStrategy strategy = CBQParallelResult.ParallelStrategy.WAIT_ALL;
+
+        ParallelBuilder(CBQRestClient client, List<Mono<CBQResponse<T>>> requests) {
+            this.client = client;
+            this.requests = requests;
+        }
+
+        public ParallelBuilder<T> waitAll() {
+            this.strategy = CBQParallelResult.ParallelStrategy.WAIT_ALL;
+            return this;
+        }
+
+        public ParallelBuilder<T> failFast() {
+            this.strategy = CBQParallelResult.ParallelStrategy.FAIL_FAST;
+            return this;
+        }
+
+        public ParallelBuilder<T> partialSuccess() {
+            this.strategy = CBQParallelResult.ParallelStrategy.PARTIAL_SUCCESS;
+            return this;
+        }
+
+        public Mono<CBQParallelResult<T>> execute() {
+            long startTime = System.currentTimeMillis();
+            
+            switch (strategy) {
+                case FAIL_FAST:
+                    return executeFailFast(startTime);
+                case PARTIAL_SUCCESS:
+                    return executePartialSuccess(startTime);
+                case WAIT_ALL:
+                default:
+                    return executeWaitAll(startTime);
+            }
+        }
+
+        private Mono<CBQParallelResult<T>> executeWaitAll(long startTime) {
+            // Use Mono.zip for wait-all semantics
+            @SuppressWarnings("unchecked")
+            Mono<CBQResponse<T>>[] monos = requests.toArray(new Mono[0]);
+            
+            return Mono.zip(Arrays.asList(monos), results -> {
+                List<CBQResponse<T>> responses = new ArrayList<>();
+                for (Object result : results) {
+                    responses.add((CBQResponse<T>) result);
+                }
+                return CBQParallelResult.<T>builder()
+                        .responses(responses)
+                        .totalDurationMs(System.currentTimeMillis() - startTime)
+                        .strategy(strategy)
+                        .build();
+            }).subscribeOn(client.parallelScheduler);
+        }
+
+        private Mono<CBQParallelResult<T>> executeFailFast(long startTime) {
+            // Use Flux.merge which fails fast
+            Map<Integer, Throwable> errors = new HashMap<>();
+            List<CBQResponse<T>> responses = new ArrayList<>();
+            
+            return Flux.merge(requests)
+                    .collectList()
+                    .map(list -> CBQParallelResult.<T>builder()
+                            .responses(list)
+                            .totalDurationMs(System.currentTimeMillis() - startTime)
+                            .strategy(strategy)
+                            .build())
+                    .subscribeOn(client.parallelScheduler);
+        }
+
+        private Mono<CBQParallelResult<T>> executePartialSuccess(long startTime) {
+            Map<Integer, Throwable> errors = Collections.synchronizedMap(new HashMap<>());
+            List<CBQResponse<T>> responses = Collections.synchronizedList(new ArrayList<>());
+            
+            List<Mono<CBQResponse<T>>> safeRequests = new ArrayList<>();
+            for (int i = 0; i < requests.size(); i++) {
+                final int index = i;
+                safeRequests.add(requests.get(i)
+                        .doOnNext(responses::add)
+                        .onErrorResume(e -> {
+                            errors.put(index, e);
+                            return Mono.empty();
+                        }));
+            }
+            
+            return Flux.merge(safeRequests)
+                    .then(Mono.fromSupplier(() -> CBQParallelResult.<T>builder()
+                            .responses(responses)
+                            .errors(errors)
+                            .totalDurationMs(System.currentTimeMillis() - startTime)
+                            .strategy(strategy)
+                            .build()))
+                    .subscribeOn(client.parallelScheduler);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sequence Builder
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public static class SequenceBuilder {
+        private final CBQRestClient client;
+        private final List<java.util.function.Function<Object, Mono<?>>> steps = new ArrayList<>();
+
+        SequenceBuilder(CBQRestClient client) {
+            this.client = client;
+        }
+
+        public <T> SequenceBuilder then(java.util.function.Supplier<Mono<CBQResponse<T>>> step) {
+            steps.add(prev -> step.get());
+            return this;
+        }
+
+        public <I, O> SequenceBuilder then(java.util.function.Function<I, Mono<CBQResponse<O>>> step) {
+            steps.add(prev -> step.apply((I) prev));
+            return this;
+        }
+
+        @SuppressWarnings("unchecked")
+        public <T> Mono<T> execute() {
+            if (steps.isEmpty()) return Mono.empty();
+            
+            Mono<Object> chain = (Mono<Object>) steps.get(0).apply(null)
+                    .map(resp -> ((CBQResponse<?>) resp).getBody());
+            
+            for (int i = 1; i < steps.size(); i++) {
+                final int idx = i;
+                chain = chain.flatMap(prev -> 
+                        (Mono<Object>) steps.get(idx).apply(prev)
+                                .map(resp -> ((CBQResponse<?>) resp).getBody()));
+            }
+            
+            return (Mono<T>) chain;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Lifecycle
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    public void shutdown() {
+        if (loggingService != null) loggingService.shutdown();
+        if (parallelScheduler != null) parallelScheduler.dispose();
+    }
+
+    public CBQRestClientConfig getConfig() { return config; }
+    public ResilienceManager getResilienceManager() { return resilienceManager; }
+}
+
+
