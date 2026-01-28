@@ -1,0 +1,255 @@
+// File: com/cbq/restclient/core/CBQRestClient.java
+package com.cbq.restclient.core;
+
+import com.cbq.restclient.config.*;
+import com.cbq.restclient.email.EmailNotifier;
+import com.cbq.restclient.filter.*;
+import com.cbq.restclient.logging.LoggingService;
+import com.cbq.restclient.model.*;
+import com.cbq.restclient.resilience.ResilienceManager;
+import com.cbq.restclient.tracing.TracingService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.*;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.function.Consumer;
+
+public final class CBQRestClient {
+    private static final Logger log = LoggerFactory.getLogger(CBQRestClient.class);
+
+    private final CBQRestClientConfig config;
+    private final WebClient webClient;
+    private final ResilienceManager resilienceManager;
+    private final LoggingService loggingService;
+    private final EmailNotifier emailNotifier;
+    private final TracingService tracingService;
+
+    private final HttpHeaders immutableDefaultHeaders;
+    private final Map<HttpStatus, List<ErrorMapper>> globalErrorMappersByStatus;
+
+    CBQRestClient(CBQRestClientConfig config,
+                  WebClient webClient,
+                  ResilienceManager resilienceManager,
+                  LoggingService loggingService,
+                  EmailNotifier emailNotifier,
+                  TracingService tracingService) {
+
+        this.config = config;
+        this.webClient = webClient;
+        this.resilienceManager = resilienceManager;
+        this.loggingService = loggingService;
+        this.emailNotifier = emailNotifier;
+        this.tracingService = tracingService;
+
+        this.immutableDefaultHeaders = HttpHeaders.readOnlyHttpHeaders(config.getDefaultHeaders());
+        this.globalErrorMappersByStatus = indexErrorMappers(config.getErrorMappers());
+    }
+
+    // ─────────────────────────── HTTP entry points ───────────────────────────
+
+    public RequestSpec get() { return new RequestSpec(this, HttpMethod.GET); }
+    public RequestSpec post() { return new RequestSpec(this, HttpMethod.POST); }
+    public RequestSpec put() { return new RequestSpec(this, HttpMethod.PUT); }
+    public RequestSpec delete() { return new RequestSpec(this, HttpMethod.DELETE); }
+
+    // ─────────────────────────── RequestSpec ───────────────────────────
+
+    public static final class RequestSpec {
+        private final CBQRestClient client;
+        private final HttpMethod method;
+
+        private String uri = "";
+        private final HttpHeaders headers = new HttpHeaders();
+        private Object body;
+        private MediaType contentType = MediaType.APPLICATION_JSON;
+        private RequestOverride override;
+        private EmailNotification emailNotification;
+        private final List<ErrorMapper> errorMappers = new ArrayList<>();
+
+        RequestSpec(CBQRestClient client, HttpMethod method) {
+            this.client = client;
+            this.method = method;
+        }
+
+        public RequestSpec uri(String uri) {
+            this.uri = uri;
+            return this;
+        }
+
+        public RequestSpec header(String name, String value) {
+            headers.add(name, value);
+            return this;
+        }
+
+        public RequestSpec bodyValue(Object body) {
+            this.body = body;
+            return this;
+        }
+
+        public RequestSpec contentType(MediaType type) {
+            this.contentType = type;
+            return this;
+        }
+
+        public RequestSpec override(Consumer<RequestOverride> c) {
+            this.override = RequestOverride.create();
+            c.accept(this.override);
+            return this;
+        }
+
+        public RequestSpec onStatus(HttpStatus status,
+                                    java.util.function.Function<ErrorMapper.ErrorContext, Throwable> mapper) {
+            this.errorMappers.add(ErrorMapper.onStatus(s -> s == status, mapper));
+            return this;
+        }
+
+        public <T> Mono<CBQResponse<T>> retrieve(Class<T> type) {
+            return client.execute(this, type);
+        }
+    }
+
+    // ─────────────────────────── Execution ───────────────────────────
+
+    <T> Mono<CBQResponse<T>> execute(RequestSpec spec, Class<T> responseType) {
+        final long start = System.currentTimeMillis();
+        final String requestId = tracingService.generateRequestId();
+
+        HttpHeaders merged = mergeHeaders(spec.headers);
+        String correlationId = tracingService.getOrCreateCorrelationId(merged);
+        tracingService.addTracingHeaders(merged, correlationId);
+
+        WebClient.RequestBodySpec req = webClient
+                .method(spec.method)
+                .uri(buildFullUrl(spec.uri))
+                .headers(h -> h.addAll(merged));
+
+        WebClient.RequestHeadersSpec<?> finalReq =
+                spec.body != null
+                        ? req.contentType(spec.contentType).body(BodyInserters.fromValue(spec.body))
+                        : req;
+
+        Mono<CBQResponse<T>> mono =
+                finalReq.exchangeToMono(r ->
+                        handleResponse(r, spec, responseType, requestId, correlationId, start))
+                        .timeout(resolveTimeout(spec.override));
+
+        mono = resilienceManager.applyResilience(
+                mono, spec.override, requestId, spec.uri, spec.method.name());
+
+        return mono.doOnError(e -> handleError(e, spec, requestId, correlationId, start));
+    }
+
+    private <T> Mono<CBQResponse<T>> handleResponse(ClientResponse r,
+                                                   RequestSpec spec,
+                                                   Class<T> type,
+                                                   String requestId,
+                                                   String correlationId,
+                                                   long start) {
+
+        HttpStatus status = r.statusCode();
+        HttpHeaders headers = r.headers().asHttpHeaders();
+
+        ErrorMapper mapper = resolveErrorMapper(status, spec.errorMappers);
+        if (mapper != null) {
+            return r.bodyToMono(String.class)
+                    .defaultIfEmpty("")
+                    .flatMap(b -> Mono.error(mapper.mapError(
+                            new ErrorMapper.ErrorContext(requestId, status,
+                                    spec.method.name(), spec.uri, b, headers))));
+        }
+
+        return r.bodyToMono(type)
+                .defaultIfEmpty(empty(type))
+                .map(body -> {
+                    long dur = System.currentTimeMillis() - start;
+
+                    if (loggingService.isBodyLoggingEnabled()) {
+                        loggingService.logResponse(
+                                requestId, correlationId, status.value(),
+                                headers, body, dur, headers.getFirst(HttpHeaders.CONTENT_TYPE));
+                    }
+
+                    return CBQResponse.<T>builder()
+                            .body(body)
+                            .status(status)
+                            .headers(headers)
+                            .durationMs(dur)
+                            .requestId(requestId)
+                            .correlationId(correlationId)
+                            .build();
+                });
+    }
+
+    private void handleError(Throwable e,
+                             RequestSpec spec,
+                             String requestId,
+                             String correlationId,
+                             long start) {
+
+        long dur = System.currentTimeMillis() - start;
+        loggingService.logError(requestId, spec.method.name(), spec.uri, e, dur);
+
+        if (spec.emailNotification != null && emailNotifier != null) {
+            emailNotifier.notify(
+                    new EmailNotifier.ErrorEvent(
+                            requestId, correlationId, spec.method.name(),
+                            spec.uri, e, dur),
+                    spec.emailNotification);
+        }
+    }
+
+    // ─────────────────────────── Helpers ───────────────────────────
+
+    private HttpHeaders mergeHeaders(HttpHeaders request) {
+        if (request.isEmpty()) return immutableDefaultHeaders;
+
+        HttpHeaders merged = new HttpHeaders();
+        merged.addAll(immutableDefaultHeaders);
+        request.forEach((k, v) -> {
+            merged.remove(k);
+            merged.put(k, v);
+        });
+        return merged;
+    }
+
+    private Duration resolveTimeout(RequestOverride o) {
+        return o != null && o.getResponseTimeout() != null
+                ? o.getResponseTimeout()
+                : config.getTimeouts().getResponseTimeout();
+    }
+
+    private String buildFullUrl(String uri) {
+        String base = config.getBaseUrl();
+        if (base == null || base.isEmpty()) return uri;
+        return uri.startsWith("/") ? base + uri : base + "/" + uri;
+    }
+
+    private static <T> T empty(Class<T> t) {
+        if (t == String.class) return (T) "";
+        return null;
+    }
+
+    private ErrorMapper resolveErrorMapper(HttpStatus status, List<ErrorMapper> requestMappers) {
+        List<ErrorMapper> global = globalErrorMappersByStatus.get(status);
+        if (global != null && !global.isEmpty()) return global.get(0);
+        return requestMappers.isEmpty() ? null : requestMappers.get(0);
+    }
+
+    private static Map<HttpStatus, List<ErrorMapper>> indexErrorMappers(List<ErrorMapper> mappers) {
+        Map<HttpStatus, List<ErrorMapper>> map = new EnumMap<>(HttpStatus.class);
+        for (ErrorMapper m : mappers) {
+            for (HttpStatus s : HttpStatus.values()) {
+                if (m.matches(s)) {
+                    map.computeIfAbsent(s, k -> new ArrayList<>(1)).add(m);
+                }
+            }
+        }
+        return map;
+    }
+}
